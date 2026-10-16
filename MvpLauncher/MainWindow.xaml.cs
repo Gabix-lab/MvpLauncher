@@ -23,6 +23,7 @@ namespace MvpLauncher
     {
         private const string DefaultServerName = "WoodCraft";
         private const string DefaultServerIp = "play.woodcraft.hu";
+        private const int MaxMultiLaunchClients = 10;
 
         private MinecraftPath _minecraftPath;
         private string _modsFolder;
@@ -31,6 +32,8 @@ namespace MvpLauncher
         private bool _isUpdatingMods;
         private bool _isLoadingProfiles;
         private bool _isLoadingSettings;
+        private bool _updatingMultiCount;
+        private bool _restoringMultiLaunch;
         private JELoginHandler? _loginHandler;
         private UpdateInfo? _pendingUpdate;
         private System.Windows.Threading.DispatcherTimer? _updateTimer;
@@ -47,6 +50,8 @@ namespace MvpLauncher
 
         public ObservableCollection<ModrinthItem> ModrinthResults { get; } = new();
         public ObservableCollection<ModrinthVersion> ModrinthVersions { get; } = new();
+
+        public ObservableCollection<MultiLaunchInstance> MultiLaunchInstances { get; } = new();
 
         private string T(string key) => TranslationSource.Instance[key];
 
@@ -178,6 +183,7 @@ namespace MvpLauncher
                 }
 
                 UpdateSkin();
+                RestoreMultiLaunchFromSettings();
                 _ = CheckForUpdatesAsync(showPopup: true);
                 StartUpdateTimer();
             };
@@ -187,6 +193,7 @@ namespace MvpLauncher
             Closing += (s, e) =>
             {
                 SaveCurrentSettings();
+                SaveMultiLaunchToSettings();
                 _cacheManager.ClearCache();
             };
         }
@@ -557,9 +564,14 @@ namespace MvpLauncher
             }
 
             cmbProfiles.Items.Clear();
-            foreach (var p in _settings.Profiles)
+            var sortedNames = _settings.Profiles
+                .Select(p => p.Name)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var name in sortedNames)
             {
-                cmbProfiles.Items.Add(p.Name);
+                cmbProfiles.Items.Add(name);
             }
 
             if (!string.IsNullOrEmpty(_settings.SelectedProfile) &&
@@ -575,6 +587,7 @@ namespace MvpLauncher
             _isLoadingProfiles = false;
 
             UpdateSkin();
+            UpdateMultiLaunchAccounts();
         }
 
         private void CmbProfiles_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1172,6 +1185,204 @@ namespace MvpLauncher
             }
         }
 
+        private void TxtMultiCount_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!IsLoaded || _updatingMultiCount || _restoringMultiLaunch) return;
+
+            if (!int.TryParse(txtMultiCount.Text, out int count))
+                return;
+
+            if (count < 0) count = 0;
+            if (count > MaxMultiLaunchClients) count = MaxMultiLaunchClients;
+
+            while (MultiLaunchInstances.Count < count)
+                AddMultiLaunchInstance();
+
+            while (MultiLaunchInstances.Count > count)
+                MultiLaunchInstances.RemoveAt(MultiLaunchInstances.Count - 1);
+
+            RefreshMultiLaunchIndices();
+            UpdateMultiEmptyLabel();
+            SaveMultiLaunchToSettings();
+        }
+
+        private void BtnAddMultiInstance_Click(object sender, RoutedEventArgs e)
+        {
+            if (MultiLaunchInstances.Count >= MaxMultiLaunchClients) return;
+            AddMultiLaunchInstance();
+            RefreshMultiLaunchIndices();
+            SyncMultiCountBox();
+            UpdateMultiEmptyLabel();
+            SaveMultiLaunchToSettings();
+        }
+
+        private void BtnRemoveMultiInstance_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is FrameworkElement el && el.Tag is MultiLaunchInstance inst)
+            {
+                MultiLaunchInstances.Remove(inst);
+                RefreshMultiLaunchIndices();
+                SyncMultiCountBox();
+                UpdateMultiEmptyLabel();
+                SaveMultiLaunchToSettings();
+            }
+        }
+
+        private void AddMultiLaunchInstance()
+        {
+            var inst = new MultiLaunchInstance();
+
+            var sortedNames = _settings.Profiles
+                .Select(p => p.Name)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var n in sortedNames)
+                inst.AvailableAccounts.Add(n);
+
+            if (inst.AvailableAccounts.Count > 0)
+            {
+                inst.SelectedAccount = !string.IsNullOrEmpty(_settings.SelectedProfile) &&
+                                       inst.AvailableAccounts.Contains(_settings.SelectedProfile)
+                    ? _settings.SelectedProfile
+                    : inst.AvailableAccounts[0];
+            }
+
+            inst.PropertyChanged += (s, ev) =>
+            {
+                if (ev.PropertyName == nameof(MultiLaunchInstance.SelectedAccount))
+                {
+                    SaveMultiLaunchToSettings();
+                }
+            };
+
+            inst.Index = MultiLaunchInstances.Count + 1;
+            MultiLaunchInstances.Add(inst);
+        }
+
+        private void RefreshMultiLaunchIndices()
+        {
+            for (int i = 0; i < MultiLaunchInstances.Count; i++)
+                MultiLaunchInstances[i].Index = i + 1;
+        }
+
+        private void SyncMultiCountBox()
+        {
+            _updatingMultiCount = true;
+            txtMultiCount.Text = MultiLaunchInstances.Count.ToString();
+            _updatingMultiCount = false;
+        }
+
+        private void UpdateMultiEmptyLabel()
+        {
+            if (lblMultiEmpty != null)
+            {
+                lblMultiEmpty.Visibility = MultiLaunchInstances.Count == 0
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+        }
+
+        private void UpdateMultiLaunchAccounts()
+        {
+            var sortedNames = _settings.Profiles
+                .Select(p => p.Name)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            foreach (var inst in MultiLaunchInstances)
+            {
+                var prev = inst.SelectedAccount;
+
+                inst.AvailableAccounts.Clear();
+                foreach (var n in sortedNames)
+                    inst.AvailableAccounts.Add(n);
+
+                if (!string.IsNullOrEmpty(prev) && sortedNames.Contains(prev))
+                {
+                    inst.SelectedAccount = prev;
+                }
+                else if (sortedNames.Count > 0)
+                {
+                    inst.SelectedAccount = sortedNames[0];
+                }
+                else
+                {
+                    inst.SelectedAccount = "";
+                }
+            }
+        }
+
+        private void SaveMultiLaunchToSettings()
+        {
+            try
+            {
+                _settings.MultiLaunchAccounts = MultiLaunchInstances
+                    .Select(i => i.SelectedAccount)
+                    .Where(s => !string.IsNullOrEmpty(s))
+                    .ToList();
+
+                _settings.Save();
+            }
+            catch { }
+        }
+
+        private void RestoreMultiLaunchFromSettings()
+        {
+            _restoringMultiLaunch = true;
+            try
+            {
+                var validNames = _settings.Profiles
+                    .Select(p => p.Name)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var saved = _settings.MultiLaunchAccounts ?? new List<string>();
+
+                var restoreList = saved
+                    .Where(s => !string.IsNullOrEmpty(s) && validNames.Contains(s))
+                    .Take(MaxMultiLaunchClients)
+                    .ToList();
+
+                if (restoreList.Count == 0 && _settings.Profiles.Count >= 1)
+                {
+                    restoreList.Add(_settings.SelectedProfile);
+                }
+
+                MultiLaunchInstances.Clear();
+
+                foreach (var name in restoreList)
+                {
+                    var inst = new MultiLaunchInstance { SelectedAccount = name };
+
+                    var sortedNames = _settings.Profiles
+                        .Select(p => p.Name)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    foreach (var n in sortedNames)
+                        inst.AvailableAccounts.Add(n);
+
+                    inst.PropertyChanged += (s, ev) =>
+                    {
+                        if (ev.PropertyName == nameof(MultiLaunchInstance.SelectedAccount))
+                        {
+                            SaveMultiLaunchToSettings();
+                        }
+                    };
+
+                    inst.Index = MultiLaunchInstances.Count + 1;
+                    MultiLaunchInstances.Add(inst);
+                }
+
+                SyncMultiCountBox();
+                UpdateMultiEmptyLabel();
+            }
+            finally
+            {
+                _restoringMultiLaunch = false;
+            }
+        }
+
         private async void BtnModrinthSearch_Click(object sender, RoutedEventArgs e)
         {
             _searchDebounceTimer?.Stop();
@@ -1422,6 +1633,235 @@ namespace MvpLauncher
             }
         }
 
+        private async Task<Process?> CreateAndStartGameAsync(
+            string username,
+            string accountName,
+            int ramMb,
+            string fabricVersionName,
+            bool attachExitHandler,
+            string behavior)
+        {
+            var launcher = new MinecraftLauncher(_minecraftPath);
+
+            launcher.FileProgressChanged += (s, args) =>
+            {
+                double pct = args.TotalTasks > 0
+                    ? (double)args.ProgressedTasks / args.TotalTasks * 100.0
+                    : 0;
+
+                Dispatcher.Invoke(() =>
+                {
+                    progressBar.Value = pct;
+                    lblPercent.Text = $"{pct:0}%";
+                    lblStatus.Text = string.IsNullOrEmpty(args.Name)
+                        ? T("Downloading")
+                        : $"{T("Downloading")}: {args.Name}";
+                });
+            };
+
+            MSession? session = null;
+
+            var selectedProfile = _settings.Profiles.FirstOrDefault(p => p.Name == accountName);
+
+            if (selectedProfile != null && selectedProfile.Type == "Microsoft" && _loginHandler != null)
+            {
+                try
+                {
+                    var accounts = _loginHandler.AccountManager.GetAccounts();
+                    var targetAccount = accounts.FirstOrDefault(a => a.Identifier == selectedProfile.Uuid);
+                    if (targetAccount != null)
+                        session = await _loginHandler.Authenticate(targetAccount);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[MultiLaunch] Auth hiba ({accountName}): {ex.Message}");
+                }
+            }
+
+            if (session == null)
+                session = MSession.CreateOfflineSession(username);
+
+            string javaPathForLaunch = _javaPath ?? "";
+            if (!string.IsNullOrEmpty(javaPathForLaunch) &&
+                javaPathForLaunch.EndsWith("java.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                var javawPath = javaPathForLaunch.Substring(0, javaPathForLaunch.Length - 8) + "javaw.exe";
+                if (File.Exists(javawPath))
+                    javaPathForLaunch = javawPath;
+            }
+
+            var jvmArgs = BuildJavaArguments();
+            jvmArgs.Add($"-Dfabric.addMods={_cacheManager.CacheFolderPath}");
+
+            var mArgs = new MArgument[jvmArgs.Count];
+            for (int i = 0; i < jvmArgs.Count; i++)
+                mArgs[i] = new MArgument(jvmArgs[i]);
+
+            var launchOption = new MLaunchOption
+            {
+                MaximumRamMb = ramMb,
+                Session = session,
+                JavaPath = javaPathForLaunch,
+                ExtraJvmArguments = mArgs
+            };
+
+            var process = await launcher.CreateProcessAsync(fabricVersionName, launchOption);
+
+            try
+            {
+                process.StartInfo.CreateNoWindow = true;
+                process.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                process.StartInfo.UseShellExecute = false;
+            }
+            catch { }
+
+            if (attachExitHandler)
+            {
+                process.EnableRaisingEvents = true;
+                process.Exited += (s2, ev) =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        _cacheManager.ClearCache();
+
+                        if (behavior == "Close")
+                        {
+                            Application.Current.Shutdown();
+                        }
+                        else if (behavior == "Hide")
+                        {
+                            Show();
+                            WindowState = WindowState.Normal;
+                            Activate();
+                            lblStatus.Text = T("GameClosed");
+                            SetUIEnabled(true);
+                        }
+                        else
+                        {
+                            lblStatus.Text = T("GameClosed");
+                            SetUIEnabled(true);
+                        }
+                    });
+                };
+            }
+
+            process.Start();
+            return process;
+        }
+
+        private async void BtnLaunchMultiple_Click(object sender, RoutedEventArgs e)
+        {
+            var instances = MultiLaunchInstances
+                .Where(i => !string.IsNullOrEmpty(i.SelectedAccount))
+                .ToList();
+
+            if (instances.Count == 0)
+            {
+                MessageBox.Show(T("MultiLaunchNoInstances"),
+                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            int ramMb = (int)sldRam.Value;
+
+            SetUIEnabled(false);
+            btnLaunchMultiple.IsEnabled = false;
+            progressBar.Value = 0;
+            lblPercent.Text = "0%";
+            lblStatus.Text = T("Preparing");
+            lblGameStartupTime.Text = "";
+
+            var gameStartupSw = Stopwatch.StartNew();
+
+            try
+            {
+                if (!await EnsureJavaAsync())
+                {
+                    lblStatus.Text = T("LaunchCancelled");
+                    SetUIEnabled(true);
+                    btnLaunchMultiple.IsEnabled = true;
+                    return;
+                }
+
+                var cacheProgress = new Progress<string>(msg =>
+                {
+                    lblStatus.Text = msg;
+                    System.Diagnostics.Debug.WriteLine($"[CacheMod] {msg}");
+                });
+
+                bool cacheOk = await _cacheManager.PrepareAsync(cacheProgress);
+
+                if (!cacheOk)
+                {
+                    var result = MessageBox.Show(
+                        T("CacheModFailed"),
+                        T("CacheModError"),
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+
+                    if (result == MessageBoxResult.No)
+                    {
+                        lblStatus.Text = T("LaunchCancelled");
+                        SetUIEnabled(true);
+                        btnLaunchMultiple.IsEnabled = true;
+                        return;
+                    }
+                }
+
+                lblStatus.Text = T("InstallingFabric");
+                var fabricInstaller = new FabricInstaller(new HttpClient());
+                string fabricVersionName = await fabricInstaller.Install("1.19.4", _minecraftPath);
+
+                EnsureDefaultServerExists();
+
+                int launched = 0;
+
+                foreach (var inst in instances)
+                {
+                    try
+                    {
+                        lblStatus.Text = string.Format(T("MultiLaunchLaunching"), inst.SelectedAccount);
+
+                        await CreateAndStartGameAsync(
+                            inst.SelectedAccount,
+                            inst.SelectedAccount,
+                            ramMb,
+                            fabricVersionName,
+                            attachExitHandler: false,
+                            behavior: "Nothing");
+
+                        launched++;
+
+                        await Task.Delay(1500);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[MultiLaunch] '{inst.SelectedAccount}' indítási hiba: {ex.Message}");
+                    }
+                }
+
+                gameStartupSw.Stop();
+                lblGameStartupTime.Text =
+                    $"{T("GameStartupTime")}: {gameStartupSw.Elapsed.TotalSeconds:0.00} s";
+
+                lblStatus.Text = string.Format(T("MultiLaunchClientStarted"), launched);
+                progressBar.Value = 100;
+                lblPercent.Text = "100%";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"{T("LaunchError")}:\n{ex.Message}",
+                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Error);
+                lblStatus.Text = T("LaunchError");
+            }
+            finally
+            {
+                SetUIEnabled(true);
+                btnLaunchMultiple.IsEnabled = true;
+            }
+        }
+
         private async void BtnPlay_Click(object sender, RoutedEventArgs e)
         {
             string username = _settings.SelectedProfile;
@@ -1451,24 +1891,6 @@ namespace MvpLauncher
                     SetUIEnabled(true);
                     return;
                 }
-
-                var launcher = new MinecraftLauncher(_minecraftPath);
-
-                launcher.FileProgressChanged += (s, args) =>
-                {
-                    double pct = args.TotalTasks > 0
-                        ? (double)args.ProgressedTasks / args.TotalTasks * 100.0
-                        : 0;
-
-                    Dispatcher.Invoke(() =>
-                    {
-                        progressBar.Value = pct;
-                        lblPercent.Text = $"{pct:0}%";
-                        lblStatus.Text = string.IsNullOrEmpty(args.Name)
-                            ? T("Downloading")
-                            : $"{T("Downloading")}: {args.Name}";
-                    });
-                };
 
                 var cacheProgress = new Progress<string>(msg =>
                 {
@@ -1500,9 +1922,13 @@ namespace MvpLauncher
 
                 lblStatus.Text = T("LoggingIn");
 
-                MSession? session = null;
+                EnsureDefaultServerExists();
+
+                string behavior = _settings.LauncherBehavior;
 
                 var selectedProfile = _settings.Profiles.FirstOrDefault(p => p.Name == username);
+
+                MSession? session = null;
 
                 if (selectedProfile != null && selectedProfile.Type == "Microsoft" && _loginHandler != null)
                 {
@@ -1545,8 +1971,6 @@ namespace MvpLauncher
 
                 lblStatus.Text = T("LaunchingGame");
 
-                EnsureDefaultServerExists();
-
                 string javaPathForLaunch = _javaPath ?? "";
                 if (!string.IsNullOrEmpty(javaPathForLaunch) &&
                     javaPathForLaunch.EndsWith("java.exe", StringComparison.OrdinalIgnoreCase))
@@ -1575,6 +1999,24 @@ namespace MvpLauncher
                     ExtraJvmArguments = mArgs
                 };
 
+                var launcher = new MinecraftLauncher(_minecraftPath);
+
+                launcher.FileProgressChanged += (s, args) =>
+                {
+                    double pct = args.TotalTasks > 0
+                        ? (double)args.ProgressedTasks / args.TotalTasks * 100.0
+                        : 0;
+
+                    Dispatcher.Invoke(() =>
+                    {
+                        progressBar.Value = pct;
+                        lblPercent.Text = $"{pct:0}%";
+                        lblStatus.Text = string.IsNullOrEmpty(args.Name)
+                            ? T("Downloading")
+                            : $"{T("Downloading")}: {args.Name}";
+                    });
+                };
+
                 var process = await launcher.CreateProcessAsync(fabricVersionName, launchOption);
                 process.EnableRaisingEvents = true;
 
@@ -1585,8 +2027,6 @@ namespace MvpLauncher
                     process.StartInfo.UseShellExecute = false;
                 }
                 catch { }
-
-                string behavior = _settings.LauncherBehavior;
 
                 process.Exited += (s2, ev) =>
                 {
@@ -1648,9 +2088,9 @@ namespace MvpLauncher
             btnModrinthSearch.IsEnabled = enabled;
             btnCheckUpdate.IsEnabled = enabled;
             if (btnDeleteProfile != null)
-            {
                 btnDeleteProfile.IsEnabled = enabled;
-            }
+            if (btnLaunchMultiple != null)
+                btnLaunchMultiple.IsEnabled = enabled;
         }
     }
 }

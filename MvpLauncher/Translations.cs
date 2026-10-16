@@ -119,6 +119,16 @@ namespace MvpLauncher
                 ["AboutServer"] = "Szerver",
                 ["AboutCopyright"] = "© 2026 MVP Launcher. Minden jog fenntartva.",
                 ["TabSettings"] = "Beállítások",
+                ["MultiLaunchTitle"] = "👥 Több kliens indítása",
+                ["MultiLaunchDesc"] = "Válaszd ki, mely fiókokkal induljanak a kliensek egyszerre.",
+                ["MultiLaunchCount"] = "Kliensek:",
+                ["MultiLaunchLaunchAll"] = "🚀 ÖSSZES INDÍTÁSA",
+                ["MultiLaunchNoInstances"] = "Adj hozzá legalább egy klienst!",
+                ["MultiLaunchClientStarted"] = "{0} kliens elindítva!",
+                ["MultiLaunchLaunching"] = "Indítás: {0}...",
+                ["MultiLaunchRemove"] = "Eltávolítás",
+                ["MultiLaunchAdd"] = "+ Kliens hozzáadása",
+                ["MultiLaunchEmpty"] = "Nincs kliens. Kattints a \"+ Kliens hozzáadása\" gombra.",
             },
             ["en"] = new Dictionary<string, string>
             {
@@ -233,6 +243,16 @@ namespace MvpLauncher
                 ["AboutServer"] = "Server",
                 ["AboutCopyright"] = "© 2026 MVP Launcher. All rights reserved.",
                 ["TabSettings"] = "Settings",
+                ["MultiLaunchTitle"] = "👥 Launch multiple clients",
+                ["MultiLaunchDesc"] = "Choose which accounts the clients should use simultaneously.",
+                ["MultiLaunchCount"] = "Clients:",
+                ["MultiLaunchLaunchAll"] = "🚀 LAUNCH ALL",
+                ["MultiLaunchNoInstances"] = "Add at least one client!",
+                ["MultiLaunchClientStarted"] = "{0} clients launched!",
+                ["MultiLaunchLaunching"] = "Launching: {0}...",
+                ["MultiLaunchRemove"] = "Remove",
+                ["MultiLaunchAdd"] = "+ Add client",
+                ["MultiLaunchEmpty"] = "No clients. Click \"+ Add client\" to add one.",
             }
         };
     }
