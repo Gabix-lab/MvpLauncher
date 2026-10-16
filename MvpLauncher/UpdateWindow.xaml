@@ -1,0 +1,141 @@
+<Window x:Class="MvpLauncher.UpdateWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:MvpLauncher"
+        Title="MVP Launcher frissítés"
+        Height="320" Width="520"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent">
+
+    <Border Background="{DynamicResource ClrCardBg}"
+            CornerRadius="12" Padding="25">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0"
+                       x:Name="lblTitle"
+                       Text="Új verzió elérhető"
+                       Foreground="{DynamicResource ClrTextPrimary}"
+                       FontSize="18" FontWeight="Bold"/>
+
+            <TextBlock Grid.Row="1"
+                       x:Name="lblVersionInfo"
+                       Foreground="{DynamicResource ClrTextMuted}"
+                       FontSize="12"
+                       Margin="0,6,0,14"/>
+
+            <Border Grid.Row="2"
+                    Background="{DynamicResource ClrInnerBg}"
+                    CornerRadius="6" Padding="12">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <TextBlock x:Name="lblNotes"
+                               Foreground="{DynamicResource ClrTextSecondary}"
+                               FontSize="11"
+                               TextWrapping="Wrap"/>
+                </ScrollViewer>
+            </Border>
+
+            <StackPanel Grid.Row="3" Margin="0,15,0,0">
+                <Grid>
+                    <TextBlock x:Name="lblProgress"
+                               Foreground="{DynamicResource ClrTextMuted}"
+                               FontSize="11"
+                               HorizontalAlignment="Left"/>
+                    <TextBlock x:Name="lblPercent"
+                               Foreground="{DynamicResource ClrAccentLight}"
+                               FontSize="11" FontWeight="SemiBold"
+                               HorizontalAlignment="Right"/>
+                </Grid>
+                <ProgressBar x:Name="progressBar"
+                             Height="6"
+                             Background="{DynamicResource ClrInputBg}"
+                             Foreground="{DynamicResource ClrAccentLight}"
+                             BorderThickness="0"
+                             Margin="0,6,0,0"
+                             Value="0"/>
+            </StackPanel>
+
+            <Grid Grid.Row="4" Margin="0,20,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="10"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="btnCancel"
+                        Grid.Column="0"
+                        Content="Később"
+                        Height="38" Cursor="Hand"
+                        Click="BtnCancel_Click">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Background" Value="{DynamicResource ClrInputBg}"/>
+                            <Setter Property="Foreground" Value="{DynamicResource ClrTextSecondary}"/>
+                            <Setter Property="FontSize" Value="13"/>
+                            <Setter Property="FontWeight" Value="SemiBold"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border Background="{TemplateBinding Background}"
+                                                BorderBrush="{DynamicResource ClrBorder}"
+                                                BorderThickness="1" CornerRadius="6">
+                                            <ContentPresenter HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="{DynamicResource ClrBorder}"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+
+                <Button x:Name="btnUpdate"
+                        Grid.Column="2"
+                        Content="Frissítés most"
+                        Height="38" Cursor="Hand"
+                        Background="{DynamicResource ClrAccent}"
+                        Foreground="White"
+                        FontWeight="SemiBold"
+                        Click="BtnUpdate_Click">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border Background="{TemplateBinding Background}"
+                                                CornerRadius="6">
+                                            <ContentPresenter HorizontalAlignment="Center"
+                                                              VerticalAlignment="Center"/>
+                                        </Border>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                            <Style.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter Property="Background" Value="{DynamicResource ClrAccentHover}"/>
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.4"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Button.Style>
+                </Button>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>

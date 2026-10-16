@@ -1,0 +1,29 @@
+﻿<Application x:Class="MvpLauncher.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:MvpLauncher"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <SolidColorBrush x:Key="ClrWindowBg" Color="#121214"/>
+            <SolidColorBrush x:Key="ClrCardBg" Color="#18181B"/>
+            <SolidColorBrush x:Key="ClrSurface" Color="#27272A"/>
+            <SolidColorBrush x:Key="ClrBorder" Color="#3F3F46"/>
+            <SolidColorBrush x:Key="ClrBorderHover" Color="#52525B"/>
+            <SolidColorBrush x:Key="ClrTextPrimary" Color="#FFFFFF"/>
+            <SolidColorBrush x:Key="ClrTextSecondary" Color="#D4D4D8"/>
+            <SolidColorBrush x:Key="ClrTextMuted" Color="#71717A"/>
+            <SolidColorBrush x:Key="ClrTextDim" Color="#52525B"/>
+            <SolidColorBrush x:Key="ClrAccent" Color="#2563EB"/>
+            <SolidColorBrush x:Key="ClrAccentHover" Color="#1D4ED8"/>
+            <SolidColorBrush x:Key="ClrAccentLight" Color="#3B82F6"/>
+            <SolidColorBrush x:Key="ClrSuccess" Color="#4CAF50"/>
+            <SolidColorBrush x:Key="ClrWarning" Color="#FFCA28"/>
+            <SolidColorBrush x:Key="ClrDanger" Color="#FF5252"/>
+            <SolidColorBrush x:Key="ClrOverlay" Color="#CC000000"/>
+            <SolidColorBrush x:Key="ClrInputBg" Color="#27272A"/>
+            <SolidColorBrush x:Key="ClrRowBg" Color="#27272A"/>
+            <SolidColorBrush x:Key="ClrInnerBg" Color="#121214"/>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>
