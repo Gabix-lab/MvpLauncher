@@ -3,27 +3,36 @@ using CmlLib.Core.Auth;
 using CmlLib.Core.Auth.Microsoft;
 using CmlLib.Core.ModLoaders.FabricMC;
 using CmlLib.Core.ProcessBuilder;
-using System;
-using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Net.Http;
-using System.Threading.Tasks;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
 using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
+using Velopack;
+using Velopack.Sources;
 
 namespace MvpLauncher
 {
-    public partial class MainWindow : Window
+    public partial class MainWindow : Window, INotifyPropertyChanged
     {
-        private const string DefaultServerName = "WoodCraft";
-        private const string DefaultServerIp = "play.woodcraft.hu";
         private const int MaxMultiLaunchClients = 10;
+        private const string SingleInstanceName = "Single Launch";
+        private const string MultiInstanceName = "Multi Launch";
+
+        public static readonly string AppVersion =
+            Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "1.0.0";
+
+        private const string GithubRepoUrl =
+            "https://github.com/Gabix-lab/MvpLauncher";
 
         private MinecraftPath _minecraftPath;
         private string _modsFolder;
@@ -34,14 +43,102 @@ namespace MvpLauncher
         private bool _isLoadingSettings;
         private bool _updatingMultiCount;
         private bool _restoringMultiLaunch;
+        private bool _applyingInstance;
+        private bool _isLoadingInstanceSelector = true;
+        private bool _isClosed;
+        private bool _viewTransitioning;
+        private bool _marcsiMode;
         private JELoginHandler? _loginHandler;
-        private UpdateInfo? _pendingUpdate;
         private System.Windows.Threading.DispatcherTimer? _updateTimer;
         private System.Windows.Threading.DispatcherTimer? _searchDebounceTimer;
         private string? _javaPath;
+        private UpdateManager? _velopack;
+        private string? _cachedFabricVersionName;
+        private string? _cachedAssetsVersionName;
+
+        public ICollectionView FilteredMods { get; }
+
+        private string _searchText = "";
+        public string SearchText
+        {
+            get => _searchText;
+            set
+            {
+                if (_searchText == value) return;
+
+                if (!string.IsNullOrEmpty(value) &&
+                    value.Trim().Equals("marcsi", StringComparison.OrdinalIgnoreCase) &&
+                    !_marcsiMode)
+                {
+                    _marcsiMode = true;
+                    _searchText = "";
+                    OnPropertyChanged(nameof(SearchText));
+
+                    foreach (var mod in AllMods)
+                    {
+                        mod.IsLocked = false;
+                        mod.LockReason = null;
+                    }
+
+                    FilteredMods?.Refresh();
+                    RefreshModCategories();
+
+                    if (lblStatus != null)
+                        lblStatus.Text = "Marcsi mód aktiválva – minden mod kikapcsolható!";
+                    return;
+                }
+
+                _searchText = value ?? "";
+                OnPropertyChanged();
+                FilteredMods?.Refresh();
+                RefreshModCategories();
+            }
+        }
+
+        private ModFilter _selectedModFilter = ModFilter.All;
+        public ModFilter SelectedModFilter
+        {
+            get => _selectedModFilter;
+            set
+            {
+                if (_selectedModFilter == value) return;
+                _selectedModFilter = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(IsFilterAll));
+                OnPropertyChanged(nameof(IsFilterEnabled));
+                OnPropertyChanged(nameof(IsFilterMandatory));
+                OnPropertyChanged(nameof(IsFilterDisabled));
+                FilteredMods?.Refresh();
+            }
+        }
+
+        public bool IsFilterAll
+        {
+            get => SelectedModFilter == ModFilter.All;
+            set { if (value) SelectedModFilter = ModFilter.All; }
+        }
+
+        public bool IsFilterEnabled
+        {
+            get => SelectedModFilter == ModFilter.Enabled;
+            set { if (value) SelectedModFilter = ModFilter.Enabled; }
+        }
+
+        public bool IsFilterMandatory
+        {
+            get => SelectedModFilter == ModFilter.Mandatory;
+            set { if (value) SelectedModFilter = ModFilter.Mandatory; }
+        }
+
+        public bool IsFilterDisabled
+        {
+            get => SelectedModFilter == ModFilter.Disabled;
+            set { if (value) SelectedModFilter = ModFilter.Disabled; }
+        }
+
+        public enum ModFilter { All, Enabled, Mandatory, Disabled }
 
         private readonly ModrinthService _modrinth = new();
-        private readonly UpdateService _updateService = new();
 
         public ObservableCollection<ModItem> AllMods { get; } = new();
         public ObservableCollection<ModItem> EnabledMods { get; } = new();
@@ -51,9 +148,53 @@ namespace MvpLauncher
         public ObservableCollection<ModrinthItem> ModrinthResults { get; } = new();
         public ObservableCollection<ModrinthVersion> ModrinthVersions { get; } = new();
 
+        private ModrinthItem? _selectedModrinthItem;
+        private int _versionLoadToken;
+
+        public ModrinthItem? SelectedModrinthItem
+        {
+            get => _selectedModrinthItem;
+            set
+            {
+                if (ReferenceEquals(_selectedModrinthItem, value)) return;
+                _selectedModrinthItem = value;
+                OnPropertyChanged();
+
+                if (value != null)
+                    _ = LoadVersionsForSelectedAsync(value);
+                else
+                    ModrinthVersions?.Clear();
+            }
+        }
+
+        private async Task LoadVersionsForSelectedAsync(ModrinthItem item)
+        {
+            int token = ++_versionLoadToken;
+            if (lblModrinthStatus != null)
+                lblModrinthStatus.Text = $"{item.Title} verzióinak betöltése...";
+            ModrinthVersions.Clear();
+
+            try
+            {
+                var versions = await _modrinth.GetVersionsAsync(item.ProjectId, "1.19.4", "fabric");
+                if (token != _versionLoadToken) return;
+                foreach (var v in versions) ModrinthVersions.Add(v);
+                if (lblModrinthStatus != null)
+                    lblModrinthStatus.Text = $"{item.Title}: {ModrinthVersions.Count} verzió";
+            }
+            catch (Exception ex)
+            {
+                if (token != _versionLoadToken) return;
+                if (lblModrinthStatus != null)
+                    lblModrinthStatus.Text = $"Hiba: {ex.Message}";
+            }
+        }
+
         public ObservableCollection<MultiLaunchInstance> MultiLaunchInstances { get; } = new();
 
-        private string T(string key) => TranslationSource.Instance[key];
+        public ObservableCollection<InstanceProfile> InstanceProfiles => _settings.InstanceProfiles;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
 
         private static string GetStringProperty(object obj, string propertyName)
         {
@@ -116,7 +257,17 @@ namespace MvpLauncher
 
         public MainWindow()
         {
+            _settings = AppSettings.Load();
+
             InitializeComponent();
+
+            Opacity = 0;
+            IsVisibleChanged += MainWindow_IsVisibleChanged;
+
+            FilteredMods = CollectionViewSource.GetDefaultView(AllMods);
+            FilteredMods.Filter = FilterMods;
+            FilteredMods.SortDescriptions.Add(new SortDescription(nameof(ModItem.DisplayName), ListSortDirection.Ascending));
+
             DataContext = this;
 
             string customPath = Path.Combine(
@@ -128,17 +279,16 @@ namespace MvpLauncher
             _cacheManager = new CacheModManager(
                 Path.Combine(Path.GetTempPath(), "mvplauncher-cache"));
 
-            _cacheManager.ClearCache();
-
             _cacheManager.Mods.Add(new CacheMod
             {
                 FileName = "mvp.jar",
-                Url = "https://mvp-backend-bods.onrender.com/mod/mvp",
-                VersionUrl = "https://mvp-backend-bods.onrender.com/mod/version"
+                GitHubRepo = "Gabix-lab/Actionbar-Snapshot"
             });
 
-            _settings = AppSettings.Load();
-            TranslationSource.Instance.Language = _settings.Language;
+            _cacheManager.VersionChanged += (s, e) =>
+            {
+                _ = Dispatcher.InvokeAsync(UpdateCachedModVersion);
+            };
 
             try
             {
@@ -146,11 +296,38 @@ namespace MvpLauncher
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[Microsoft] Init hiba: {ex.Message}");
+                Debug.WriteLine($"[Microsoft] Init hiba: {ex.Message}");
                 _loginHandler = null;
             }
 
             _javaPath = JavaManager.FindJava();
+
+            JavaManager.JavaReady += (s, path) =>
+            {
+                if (!string.IsNullOrEmpty(path))
+                {
+                    _ = Dispatcher.InvokeAsync(() => _javaPath = path);
+                }
+            };
+
+            JavaManager.InstallProgress += (s, pct) =>
+            {
+                _ = Dispatcher.InvokeAsync(() =>
+                {
+                    SetProgress(pct);
+                    if (JavaManager.IsInstalling && lblStatus != null)
+                        lblStatus.Text = $"Java letöltése... ({pct}%)";
+                });
+            };
+
+            JavaManager.InstallStateChanged += (s, running) =>
+            {
+                _ = Dispatcher.InvokeAsync(() =>
+                {
+                    if (lblStatus != null && running && string.IsNullOrEmpty(_javaPath))
+                        lblStatus.Text = "Java 17 automatikus előkészítése...";
+                });
+            };
 
             _searchDebounceTimer = new System.Windows.Threading.DispatcherTimer
             {
@@ -164,38 +341,499 @@ namespace MvpLauncher
 
             EnsureModsFolderExists();
             SyncBundledModsToModsFolder();
-            EnsureDefaultServerExists();
-            LoadMods();
-            LoadProfiles();
-            LoadSettingsIntoUI();
 
             long totalRamMb = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024L * 1024L);
             sldRam.Maximum = Math.Max(totalRamMb, 2048);
 
-            Loaded += (s, e) =>
+            LoadMods();
+            LoadProfiles();
+            LoadSettingsIntoUI();
+            EnsureDefaultInstances();
+
+            Loaded += async (s, e) =>
             {
-                App.StartupStopwatch.Stop();
-                lblStartupTime.Text = $"{T("StartupTime")}: {App.StartupStopwatch.ElapsedMilliseconds} ms";
-
-                if (lblAboutVersion != null)
+                try
                 {
-                    lblAboutVersion.Text = $"{T("AboutVersion")}: {UpdateService.CurrentVersion}";
-                }
+                    App.StartupStopwatch.Stop();
+                    if (lblStartupTime != null)
+                        lblStartupTime.Text = $"Indulási idő: {App.StartupStopwatch.ElapsedMilliseconds} ms";
+                    if (lblHeaderVersion != null)
+                        lblHeaderVersion.Text = $"v{AppVersion}";
+                    if (lblAboutVersion != null)
+                    {
+                        lblAboutVersion.Text = $"Verzió: {AppVersion}";
+                    }
 
-                UpdateSkin();
-                RestoreMultiLaunchFromSettings();
-                _ = CheckForUpdatesAsync(showPopup: true);
-                StartUpdateTimer();
+                    JavaManager.StartBackgroundInstallIfNeeded();
+
+                    LoadSettingsIntoUI();
+                    UpdateSkin();
+                    RestoreMultiLaunchFromSettings();
+
+                    _ = CheckForUpdatesAsync(showPopup: false);
+
+                    StartUpdateTimer();
+
+                    await Task.CompletedTask;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Loaded] Hiba: {ex}");
+                    if (lblStatus != null)
+                        lblStatus.Text = $"Hiba: {ex.Message}";
+                }
             };
 
-            _ = _cacheManager.FetchVersionAsync();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _cacheManager.FetchVersionAsync();
+                    await Dispatcher.InvokeAsync(UpdateCachedModVersion);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[CacheMod] FetchVersion hiba: {ex.Message}");
+                }
+            });
 
             Closing += (s, e) =>
             {
-                SaveCurrentSettings();
-                SaveMultiLaunchToSettings();
-                _cacheManager.ClearCache();
+                _isClosed = true;
+                try
+                {
+                    SaveCurrentSettings();
+                    SaveMultiLaunchToSettings();
+                    _updateTimer?.Stop();
+                    _searchDebounceTimer?.Stop();
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[Closing] Hiba: {ex.Message}");
+                }
             };
+        }
+
+        private void MainWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (e.NewValue is bool visible && visible)
+            {
+                BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    From = 0,
+                    To = 1,
+                    Duration = TimeSpan.FromMilliseconds(220),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+        }
+
+        private void SetProgress(double pct, bool smooth = true)
+        {
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+
+            if (lblPercent != null)
+                lblPercent.Text = $"{(int)pct}%";
+
+            if (progressBar == null) return;
+
+            if (smooth)
+            {
+                progressBar.BeginAnimation(RangeBase.ValueProperty, new DoubleAnimation
+                {
+                    To = pct,
+                    Duration = TimeSpan.FromMilliseconds(250),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+            else
+            {
+                progressBar.BeginAnimation(RangeBase.ValueProperty, null);
+                progressBar.Value = pct;
+            }
+        }
+
+        private UIElement? GetVisibleView()
+        {
+            if (MainView?.Visibility == Visibility.Visible) return MainView;
+            if (ModsView?.Visibility == Visibility.Visible) return ModsView;
+            if (SettingsView?.Visibility == Visibility.Visible) return SettingsView;
+            return null;
+        }
+
+        private async Task ShowOnlyAsync(UIElement target)
+        {
+            if (_viewTransitioning) return;
+            var previous = GetVisibleView();
+            if (previous == target) return;
+
+            _viewTransitioning = true;
+            try
+            {
+                if (previous != null)
+                {
+                    var tcs = new TaskCompletionSource();
+                    var fadeOut = new DoubleAnimation
+                    {
+                        To = 0,
+                        Duration = TimeSpan.FromMilliseconds(130),
+                        EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn }
+                    };
+                    fadeOut.Completed += (s, e) => tcs.TrySetResult();
+                    previous.BeginAnimation(OpacityProperty, fadeOut);
+                    await Task.WhenAny(tcs.Task, Task.Delay(200));
+                    previous.Visibility = Visibility.Collapsed;
+                    previous.BeginAnimation(OpacityProperty, null);
+                    previous.Opacity = 1;
+                }
+
+                target.Opacity = 0;
+                var translate = new TranslateTransform(0, 14);
+                target.RenderTransform = translate;
+                target.Visibility = Visibility.Visible;
+
+                target.BeginAnimation(OpacityProperty, new DoubleAnimation
+                {
+                    From = 0,
+                    To = 1,
+                    Duration = TimeSpan.FromMilliseconds(240),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+                translate.BeginAnimation(TranslateTransform.YProperty, new DoubleAnimation
+                {
+                    From = 14,
+                    To = 0,
+                    Duration = TimeSpan.FromMilliseconds(280),
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+            }
+            finally
+            {
+                _viewTransitioning = false;
+            }
+        }
+
+        private void UpdateCachedModVersion()
+        {
+            var cacheItem = AllMods.FirstOrDefault(m => m.IsFromCache);
+            if (cacheItem != null && !string.IsNullOrEmpty(_cacheManager.CurrentVersion))
+            {
+                cacheItem.Version = _cacheManager.CurrentVersion;
+            }
+        }
+
+        private bool FilterMods(object obj)
+        {
+            if (obj is not ModItem mod) return false;
+
+            if (!string.IsNullOrWhiteSpace(_searchText))
+            {
+                if (!mod.DisplayName.Contains(_searchText, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+
+            switch (_selectedModFilter)
+            {
+                case ModFilter.Enabled:
+                    return mod.IsEnabled && !mod.IsLocked && !mod.IsFromCache;
+                case ModFilter.Mandatory:
+                    return mod.IsLocked || mod.IsFromCache;
+                case ModFilter.Disabled:
+                    return !mod.IsEnabled && !mod.IsLocked && !mod.IsFromCache;
+                default:
+                    return true;
+            }
+        }
+
+        private string GetFabricMarkerPath()
+        {
+            string basePath = _minecraftPath.BasePath ?? "";
+            return Path.Combine(basePath, "fabric-version.marker");
+        }
+
+        private string GetAssetsMarkerPath()
+        {
+            string basePath = _minecraftPath.BasePath ?? "";
+            return Path.Combine(basePath, "assets-checked.marker");
+        }
+
+        private async Task<string> GetOrInstallFabricVersionAsync()
+        {
+            if (!string.IsNullOrEmpty(_cachedFabricVersionName))
+                return _cachedFabricVersionName!;
+
+            string markerPath = GetFabricMarkerPath();
+
+            try
+            {
+                if (File.Exists(markerPath))
+                {
+                    var cached = File.ReadAllText(markerPath).Trim();
+                    if (!string.IsNullOrEmpty(cached))
+                    {
+                        string versionsBase = _minecraftPath.BasePath ?? "";
+                        var versionsDir = Path.Combine(versionsBase, "versions", cached);
+                        if (Directory.Exists(versionsDir))
+                        {
+                            _cachedFabricVersionName = cached;
+                            return cached;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            var fabricInstaller = new FabricInstaller(new HttpClient());
+            var versionName = await fabricInstaller.Install("1.19.4", _minecraftPath);
+
+            try
+            {
+                string? dir = Path.GetDirectoryName(markerPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                File.WriteAllText(markerPath, versionName);
+            }
+            catch { }
+
+            _cachedFabricVersionName = versionName;
+            return versionName;
+        }
+
+        private bool ShouldSkipAssetProgress(string versionName)
+        {
+            if (string.Equals(_cachedAssetsVersionName, versionName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            string markerPath = GetAssetsMarkerPath();
+
+            try
+            {
+                if (File.Exists(markerPath))
+                {
+                    var cached = File.ReadAllText(markerPath).Trim();
+                    if (string.Equals(cached, versionName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _cachedAssetsVersionName = cached;
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        private void MarkAssetsChecked(string versionName)
+        {
+            _cachedAssetsVersionName = versionName;
+            string markerPath = GetAssetsMarkerPath();
+
+            try
+            {
+                string? dir = Path.GetDirectoryName(markerPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                File.WriteAllText(markerPath, versionName);
+            }
+            catch { }
+        }
+
+        private void EnsureDefaultInstances()
+        {
+            var toRemove = _settings.InstanceProfiles
+                .Where(p => p.Name != SingleInstanceName && p.Name != MultiInstanceName)
+                .ToList();
+            foreach (var p in toRemove)
+            {
+                _settings.InstanceProfiles.Remove(p);
+            }
+
+            var currentEnabled = AllMods
+                .Where(m => m.IsEnabled && !m.IsMandatory && !m.IsFromCache)
+                .Select(m => m.DisplayName)
+                .ToList();
+
+            if (!_settings.InstanceProfiles.Any(p => p.Name == SingleInstanceName))
+            {
+                _settings.InstanceProfiles.Add(new InstanceProfile
+                {
+                    Name = SingleInstanceName,
+                    EnabledMods = new List<string>(currentEnabled)
+                });
+            }
+
+            if (!_settings.InstanceProfiles.Any(p => p.Name == MultiInstanceName))
+            {
+                _settings.InstanceProfiles.Add(new InstanceProfile
+                {
+                    Name = MultiInstanceName,
+                    EnabledMods = new List<string>(currentEnabled)
+                });
+            }
+
+            if (_settings.SelectedInstanceProfile != SingleInstanceName &&
+                _settings.SelectedInstanceProfile != MultiInstanceName)
+            {
+                _settings.SelectedInstanceProfile = SingleInstanceName;
+            }
+
+            _settings.Save();
+
+            _isLoadingInstanceSelector = true;
+            cmbInstanceSelector.SelectedIndex =
+                _settings.SelectedInstanceProfile == MultiInstanceName ? 1 : 0;
+            _isLoadingInstanceSelector = false;
+
+            UpdateCurrentInstanceLabel();
+
+            var profile = _settings.InstanceProfiles
+                .First(p => p.Name == _settings.SelectedInstanceProfile);
+            ApplyInstanceProfile(profile);
+        }
+
+        private void UpdateCurrentInstanceLabel()
+        {
+            if (lblCurrentInstance != null)
+            {
+                lblCurrentInstance.Text = _settings.SelectedInstanceProfile == MultiInstanceName
+                    ? "Multi Launch"
+                    : "Single Launch";
+            }
+        }
+
+        private void SwitchToInstance(string instanceName)
+        {
+            if (_settings.SelectedInstanceProfile == instanceName) return;
+
+            var profile = _settings.InstanceProfiles
+                .FirstOrDefault(p => p.Name == instanceName);
+            if (profile == null) return;
+
+            SyncCurrentInstanceFromMods();
+
+            _settings.SelectedInstanceProfile = instanceName;
+            _settings.Save();
+
+            _isLoadingInstanceSelector = true;
+            cmbInstanceSelector.SelectedIndex =
+                instanceName == MultiInstanceName ? 1 : 0;
+            _isLoadingInstanceSelector = false;
+
+            UpdateCurrentInstanceLabel();
+            ApplyInstanceProfile(profile);
+        }
+
+        private void CmbInstanceSelector_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!IsLoaded) return;
+            if (_isLoadingInstanceSelector) return;
+            if (cmbInstanceSelector.SelectedItem is not ComboBoxItem item) return;
+            if (item.Tag is not string tag) return;
+
+            string newProfileName = tag == "Multi" ? MultiInstanceName : SingleInstanceName;
+
+            if (_settings.SelectedInstanceProfile == newProfileName) return;
+
+            SyncCurrentInstanceFromMods();
+
+            _settings.SelectedInstanceProfile = newProfileName;
+            _settings.Save();
+
+            UpdateCurrentInstanceLabel();
+
+            var profile = _settings.InstanceProfiles
+                .FirstOrDefault(p => p.Name == newProfileName);
+            if (profile != null)
+            {
+                ApplyInstanceProfile(profile);
+            }
+        }
+
+        private void ApplyInstanceProfile(InstanceProfile profile)
+        {
+            if (_applyingInstance) return;
+            _applyingInstance = true;
+            _isUpdatingMods = true;
+            try
+            {
+                var enabledSet = new HashSet<string>(
+                    profile.EnabledMods ?? new List<string>(),
+                    StringComparer.OrdinalIgnoreCase);
+
+                foreach (var mod in AllMods)
+                {
+                    if (mod.IsMandatory || mod.IsFromCache) continue;
+                    if (enabledSet.Contains(mod.DisplayName)) continue;
+                    if (!mod.IsEnabled) continue;
+
+                    bool wasLocked = mod.IsLocked;
+                    mod.IsLocked = false;
+                    mod.IsEnabled = false;
+                    mod.IsLocked = wasLocked;
+                }
+
+                UpdateLocks();
+
+                foreach (var mod in AllMods)
+                {
+                    if (mod.IsMandatory || mod.IsFromCache) continue;
+                    if (!enabledSet.Contains(mod.DisplayName)) continue;
+                    if (mod.IsEnabled) continue;
+
+                    mod.IsLocked = false;
+                    mod.IsEnabled = true;
+                    EnableDependenciesRecursive(mod, new HashSet<ModItem>());
+                }
+
+                UpdateLocks();
+                RefreshModCategories();
+            }
+            finally
+            {
+                _isUpdatingMods = false;
+                _applyingInstance = false;
+            }
+        }
+
+        private void SyncCurrentInstanceFromMods()
+        {
+            if (_applyingInstance) return;
+
+            var profile = _settings.InstanceProfiles
+                .FirstOrDefault(p => p.Name == _settings.SelectedInstanceProfile);
+            if (profile == null) return;
+
+            profile.EnabledMods = AllMods
+                .Where(m => m.IsEnabled && !m.IsMandatory && !m.IsFromCache)
+                .Select(m => m.DisplayName)
+                .ToList();
+
+            _settings.Save();
+        }
+
+        private void AddModsToCurrentInstance(IEnumerable<string> modNames)
+        {
+            var profile = _settings.InstanceProfiles
+                .FirstOrDefault(p => p.Name == _settings.SelectedInstanceProfile);
+            if (profile == null) return;
+
+            profile.EnabledMods ??= new List<string>();
+
+            foreach (var name in modNames)
+            {
+                if (!profile.EnabledMods.Any(n =>
+                    string.Equals(n, name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    profile.EnabledMods.Add(name);
+                }
+            }
+
+            _settings.Save();
         }
 
         private void EnsureModsFolderExists()
@@ -208,19 +846,6 @@ namespace MvpLauncher
                 }
             }
             catch { }
-        }
-
-        private void EnsureDefaultServerExists()
-        {
-            try
-            {
-                string serversDatPath = Path.Combine(_minecraftPath.BasePath, "servers.dat");
-                ServersDatManager.EnsureServerExists(serversDatPath, DefaultServerName, DefaultServerIp);
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[ServersDat] HIBA: {ex.Message}");
-            }
         }
 
         private void SyncBundledModsToModsFolder()
@@ -285,6 +910,15 @@ namespace MvpLauncher
 
             BuildDependencyGraph();
             RefreshModCategories();
+
+            var profile = _settings.InstanceProfiles
+                .FirstOrDefault(p => p.Name == _settings.SelectedInstanceProfile);
+            if (profile != null)
+            {
+                ApplyInstanceProfile(profile);
+            }
+
+            FilteredMods?.Refresh();
         }
 
         private void AddModItem(string path, bool enabled)
@@ -304,11 +938,36 @@ namespace MvpLauncher
                 IsEnabled = enabled
             };
 
+            bool isMandatory = actualBase.StartsWith("fabric-api-", StringComparison.OrdinalIgnoreCase) ||
+                               actualBase.StartsWith("satin-", StringComparison.OrdinalIgnoreCase);
+
+            if (isMandatory)
+            {
+                modItem.IsMandatory = true;
+                modItem.IsLocked = true;
+
+                if (!enabled)
+                {
+                    try
+                    {
+                        string disabledPath = fullPath + ".disabled";
+                        if (File.Exists(disabledPath))
+                        {
+                            File.Move(disabledPath, fullPath, overwrite: true);
+                            modItem.IsEnabled = true;
+                        }
+                    }
+                    catch { }
+                }
+            }
+
             var info = FabricMetadataReader.Read(File.Exists(fullPath) ? fullPath : path);
             if (info != null)
             {
                 modItem.ModId = info.Id;
                 modItem.Version = info.Version;
+                modItem.Author = info.Author;
+                modItem.Description = info.Description;
                 foreach (var dep in info.Depends)
                 {
                     modItem.Dependencies.Add(dep);
@@ -364,48 +1023,103 @@ namespace MvpLauncher
 
         private void UpdateLocks()
         {
+            if (_marcsiMode)
+            {
+                foreach (var mod in AllMods)
+                {
+                    mod.IsLocked = false;
+                    mod.LockReason = null;
+                }
+                FilteredMods?.Refresh();
+                return;
+            }
+
             foreach (var mod in AllMods)
             {
                 if (mod.IsFromCache)
                 {
                     mod.IsLocked = true;
+                    mod.LockReason = "Cache mod — automatikusan töltődik, nem kapcsolható ki.";
                     continue;
                 }
 
-                bool anyEnabledDependent = false;
+                if (mod.IsMandatory)
+                {
+                    mod.IsLocked = true;
+                    mod.LockReason = "Kötelező mod — a játék működéséhez szükséges, nem kapcsolható ki.";
+                    continue;
+                }
+
+                var enabledDependents = new List<string>();
                 foreach (var dependentName in mod.Dependents)
                 {
                     var dependent = AllMods.FirstOrDefault(m => m.DisplayName == dependentName);
                     if (dependent != null && dependent.IsEnabled)
                     {
-                        anyEnabledDependent = true;
-                        break;
+                        enabledDependents.Add(dependent.DisplayName);
                     }
                 }
 
-                mod.IsLocked = anyEnabledDependent;
+                if (enabledDependents.Count > 0)
+                {
+                    mod.IsLocked = true;
+                    mod.LockReason = $"Ezek a modok igénylik, ezért nem kapcsolható ki: {string.Join(", ", enabledDependents)}";
+                }
+                else
+                {
+                    mod.IsLocked = false;
+                    mod.LockReason = null;
+                }
             }
+            FilteredMods?.Refresh();
         }
 
         private void RefreshModCategories()
         {
-            EnabledMods.Clear();
-            MandatoryMods.Clear();
-            DisabledMods.Clear();
+            Dispatcher.BeginInvoke(new Action(DoRefreshModCategories),
+                System.Windows.Threading.DispatcherPriority.Normal);
+        }
 
-            foreach (var mod in AllMods.OrderBy(m => m.DisplayName))
+        private void DoRefreshModCategories()
+        {
+            var filtered = AllMods
+                .Where(m => string.IsNullOrWhiteSpace(_searchText) ||
+                            m.DisplayName.Contains(_searchText, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(m => m.DisplayName)
+                .ToList();
+
+            var mandatory = filtered.Where(m => m.IsLocked || m.IsFromCache).ToList();
+            var enabled = filtered.Where(m => !m.IsLocked && !m.IsFromCache && m.IsEnabled).ToList();
+            var disabled = filtered.Where(m => !m.IsLocked && !m.IsFromCache && !m.IsEnabled).ToList();
+
+            SyncCollection(MandatoryMods, mandatory);
+            SyncCollection(EnabledMods, enabled);
+            SyncCollection(DisabledMods, disabled);
+        }
+
+        private static void SyncCollection(ObservableCollection<ModItem> target, List<ModItem> desired)
+        {
+            for (int i = target.Count - 1; i >= 0; i--)
             {
-                if (mod.IsLocked || mod.IsFromCache)
+                if (!desired.Contains(target[i]))
                 {
-                    MandatoryMods.Add(mod);
+                    target.RemoveAt(i);
                 }
-                else if (mod.IsEnabled)
+            }
+
+            for (int i = 0; i < desired.Count; i++)
+            {
+                if (i < target.Count && ReferenceEquals(target[i], desired[i]))
+                    continue;
+
+                int existing = target.IndexOf(desired[i]);
+                if (existing >= 0)
                 {
-                    EnabledMods.Add(mod);
+                    target.Move(existing, i);
                 }
                 else
                 {
-                    DisabledMods.Add(mod);
+                    target.Insert(i, desired[i]);
                 }
             }
         }
@@ -424,11 +1138,50 @@ namespace MvpLauncher
                 }
 
                 UpdateLocks();
+                SyncCurrentInstanceFromMods();
                 RefreshModCategories();
             }
             finally
             {
                 _isUpdatingMods = false;
+            }
+        }
+
+        private void ModItemToggle_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not CheckBox cb) return;
+            if (cb.DataContext is not ModItem mod) return;
+            e.Handled = true;
+
+            if (mod.IsFromCache && !_marcsiMode && mod.IsEnabled)
+            {
+                if (lblStatus != null)
+                    lblStatus.Text = mod.LockReason ?? "Ez a mod nem kapcsolható ki.";
+                cb.IsChecked = mod.IsEnabled;
+                return;
+            }
+
+            if (mod.IsLocked && !_marcsiMode)
+            {
+                if (lblStatus != null)
+                    lblStatus.Text = mod.LockReason ?? "Ez a mod nem kapcsolható ki.";
+                cb.IsChecked = mod.IsEnabled;
+                return;
+            }
+
+            if (!mod.TryToggleEnabled(out string? error))
+            {
+                cb.IsChecked = mod.IsEnabled;
+
+                if (!string.IsNullOrEmpty(error))
+                {
+                    MessageBox.Show(error, "Mod állapotváltás sikertelen",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+
+                    if (lblStatus != null)
+                        lblStatus.Text = "A mod állapotát nem sikerült megváltoztatni.";
+                }
+                return;
             }
         }
 
@@ -468,12 +1221,12 @@ namespace MvpLauncher
 
                 if (string.IsNullOrEmpty(identifier))
                 {
-                    imgSkin.Source = null!;
-                    lblSkinLoading.Visibility = Visibility.Visible;
+                    if (imgSkin != null) imgSkin.Source = null;
+                    if (lblSkinLoading != null) lblSkinLoading.Visibility = Visibility.Visible;
                     return;
                 }
 
-                lblSkinLoading.Visibility = Visibility.Collapsed;
+                if (lblSkinLoading != null) lblSkinLoading.Visibility = Visibility.Collapsed;
 
                 var bitmap = new BitmapImage();
                 bitmap.BeginInit();
@@ -482,12 +1235,12 @@ namespace MvpLauncher
                 bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
                 bitmap.EndInit();
 
-                imgSkin.Source = bitmap;
+                if (imgSkin != null) imgSkin.Source = bitmap;
             }
             catch
             {
-                imgSkin.Source = null!;
-                lblSkinLoading.Visibility = Visibility.Visible;
+                if (imgSkin != null) imgSkin.Source = null;
+                if (lblSkinLoading != null) lblSkinLoading.Visibility = Visibility.Visible;
             }
         }
 
@@ -559,7 +1312,7 @@ namespace MvpLauncher
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Microsoft] LoadProfiles hiba: {ex.Message}");
+                    Debug.WriteLine($"[Microsoft] LoadProfiles hiba: {ex.Message}");
                 }
             }
 
@@ -637,19 +1390,19 @@ namespace MvpLauncher
 
             if (string.IsNullOrEmpty(name))
             {
-                lblNewProfileError.Text = T("ErrorNameRequired");
+                if (lblNewProfileError != null) lblNewProfileError.Text = "Adj meg egy nevet!";
                 return;
             }
 
             if (name.Length > 16)
             {
-                lblNewProfileError.Text = T("ErrorNameTooLong");
+                if (lblNewProfileError != null) lblNewProfileError.Text = "A név maximum 16 karakter lehet!";
                 return;
             }
 
             if (_settings.Profiles.Any(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase)))
             {
-                lblNewProfileError.Text = T("ErrorNameExists");
+                if (lblNewProfileError != null) lblNewProfileError.Text = "Ez a név már létezik!";
                 return;
             }
 
@@ -703,12 +1456,24 @@ namespace MvpLauncher
                     var toRemove = accounts.FirstOrDefault(a => a.Identifier == profile.Uuid);
                     if (toRemove != null)
                     {
-                        TryRemoveAccount(_loginHandler.AccountManager, toRemove);
+                        bool removed = TryRemoveAccount(_loginHandler.AccountManager, toRemove);
+                        if (!removed)
+                        {
+                            MessageBox.Show(
+                                "A Microsoft fiókot nem sikerült eltávolítani a bejelentkezett fiókok közül.\n" +
+                                "A profil törlése megszakítva, különben a következő indításnál újra megjelenne.",
+                                "Törlés sikertelen", MessageBoxButton.OK, MessageBoxImage.Warning);
+                            return;
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[Microsoft] Törlés hiba: {ex.Message}");
+                    Debug.WriteLine($"[Microsoft] Törlés hiba: {ex.Message}");
+                    MessageBox.Show(
+                        $"Nem sikerült eltávolítani a Microsoft fiókot:\n{ex.Message}",
+                        "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
                 }
             }
 
@@ -720,71 +1485,76 @@ namespace MvpLauncher
 
             LoadProfiles();
 
-            lblStatus.Text = $"Profil törölve: {selectedName}";
+            if (lblStatus != null) lblStatus.Text = $"Profil törölve: {selectedName}";
         }
 
         private async void BtnAddMicrosoft_Click(object sender, RoutedEventArgs e)
         {
             if (_loginHandler == null)
             {
-                MessageBox.Show(T("MicrosoftNotAvailable"),
-                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("A Microsoft bejelentkezés nem elérhető.\n\nTelepítsd a WebView2 Runtime-ot, majd próbáld újra.",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
             try
             {
                 btnAddMicrosoft.IsEnabled = false;
-                lblStatus.Text = T("MicrosoftLogin");
+                if (lblStatus != null) lblStatus.Text = "Microsoft bejelentkezés...";
 
                 var session = await _loginHandler.Authenticate();
 
-                if (session != null)
+                if (session == null)
                 {
-                    try
-                    {
-                        _loginHandler.AccountManager.SaveAccounts();
-                    }
-                    catch { }
-
-                    string sessionName = GetStringProperty(session, "Username");
-                    if (string.IsNullOrEmpty(sessionName))
-                    {
-                        sessionName = GetStringProperty(session, "PlayerName");
-                    }
-                    if (string.IsNullOrEmpty(sessionName))
-                    {
-                        sessionName = GetStringProperty(session, "Name");
-                    }
-                    if (string.IsNullOrEmpty(sessionName))
-                    {
-                        sessionName = "Microsoft";
-                    }
-
-                    var identifier = session.UUID;
-                    if (!_settings.Profiles.Any(p => p.Uuid == identifier))
-                    {
-                        _settings.Profiles.Add(new Profile
-                        {
-                            Name = sessionName,
-                            Type = "Microsoft",
-                            Uuid = identifier
-                        });
-                    }
-
-                    _settings.SelectedProfile = sessionName;
-                    _settings.Save();
-
-                    LoadProfiles();
-
-                    lblStatus.Text = $"{T("LoggedIn")}: {sessionName}";
+                    MessageBox.Show("A bejelentkezés nem sikerült (üres session).",
+                        "Hiba", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    if (lblStatus != null) lblStatus.Text = "Bejelentkezés sikertelen.";
+                    return;
                 }
+
+                try
+                {
+                    _loginHandler.AccountManager.SaveAccounts();
+                }
+                catch { }
+
+                string sessionName = GetStringProperty(session, "Username");
+                if (string.IsNullOrEmpty(sessionName))
+                {
+                    sessionName = GetStringProperty(session, "PlayerName");
+                }
+                if (string.IsNullOrEmpty(sessionName))
+                {
+                    sessionName = GetStringProperty(session, "Name");
+                }
+                if (string.IsNullOrEmpty(sessionName))
+                {
+                    sessionName = "Microsoft";
+                }
+
+                string identifier = session.UUID ?? string.Empty;
+                if (!string.IsNullOrEmpty(identifier) && !_settings.Profiles.Any(p => p.Uuid == identifier))
+                {
+                    _settings.Profiles.Add(new Profile
+                    {
+                        Name = sessionName,
+                        Type = "Microsoft",
+                        Uuid = identifier
+                    });
+                }
+
+                _settings.SelectedProfile = sessionName;
+                _settings.Save();
+
+                LoadProfiles();
+
+                if (lblStatus != null) lblStatus.Text = $"Bejelentkezve: {sessionName}";
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"{T("MicrosoftLoginError")}:\n{ex.Message}",
-                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Error);
-                lblStatus.Text = T("LoginFailed");
+                MessageBox.Show($"Hiba a Microsoft bejelentkezés közben:\n{ex.Message}",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (lblStatus != null) lblStatus.Text = "Bejelentkezés sikertelen.";
             }
             finally
             {
@@ -795,39 +1565,37 @@ namespace MvpLauncher
         private void LoadSettingsIntoUI()
         {
             _isLoadingSettings = true;
-
-            int ram = _settings.RamMb;
-            if (ram < sldRam.Minimum) ram = (int)sldRam.Minimum;
-            if (ram > sldRam.Maximum) ram = (int)sldRam.Maximum;
-            sldRam.Value = ram;
-            lblRamValue.Text = $"{ram} MB";
-
-            switch (_settings.Theme)
+            try
             {
-                case "Dark": rbThemeDark.IsChecked = true; break;
-                case "Light": rbThemeLight.IsChecked = true; break;
-                default: rbThemeSystem.IsChecked = true; break;
+                int ram = _settings.RamMb;
+                if (ram < sldRam.Minimum) ram = (int)sldRam.Minimum;
+                if (ram > sldRam.Maximum) ram = (int)sldRam.Maximum;
+                sldRam.Value = ram;
+                if (lblRamValue != null) lblRamValue.Text = $"{ram} MB";
+
+                switch (_settings.Theme)
+                {
+                    case "Dark": if (rbThemeDark != null) rbThemeDark.IsChecked = true; break;
+                    case "Light": if (rbThemeLight != null) rbThemeLight.IsChecked = true; break;
+                    default: if (rbThemeSystem != null) rbThemeSystem.IsChecked = true; break;
+                }
+
+                UpdateThemeDisplay();
+
+                switch (_settings.LauncherBehavior)
+                {
+                    case "Close": if (rbBehClose != null) rbBehClose.IsChecked = true; break;
+                    case "Nothing": if (rbBehNothing != null) rbBehNothing.IsChecked = true; break;
+                    default: if (rbBehHide != null) rbBehHide.IsChecked = true; break;
+                }
+
+                SelectJavaPreset(_settings.JavaPreset);
+                if (txtJavaArgs != null) txtJavaArgs.Text = _settings.JavaArgs ?? "";
             }
-
-            UpdateThemeDisplay();
-
-            switch (_settings.Language)
+            finally
             {
-                case "en": rbLanguageEn.IsChecked = true; break;
-                default: rbLanguageHu.IsChecked = true; break;
+                _isLoadingSettings = false;
             }
-
-            switch (_settings.LauncherBehavior)
-            {
-                case "Close": rbBehClose.IsChecked = true; break;
-                case "Nothing": rbBehNothing.IsChecked = true; break;
-                default: rbBehHide.IsChecked = true; break;
-            }
-
-            SelectJavaPreset(_settings.JavaPreset);
-            txtJavaArgs.Text = _settings.JavaArgs ?? "";
-
-            _isLoadingSettings = false;
         }
 
         private void SelectJavaPreset(string preset)
@@ -850,11 +1618,12 @@ namespace MvpLauncher
 
         private void UpdateThemeDisplay()
         {
+            if (lblThemeDisplay == null) return;
             switch (_settings.Theme)
             {
-                case "Dark": lblThemeDisplay.Text = T("ThemeDark"); break;
-                case "Light": lblThemeDisplay.Text = T("ThemeLight"); break;
-                default: lblThemeDisplay.Text = T("ThemeSystem"); break;
+                case "Dark": lblThemeDisplay.Text = "Sötét"; break;
+                case "Light": lblThemeDisplay.Text = "Világos"; break;
+                default: lblThemeDisplay.Text = "Rendszer"; break;
             }
         }
 
@@ -870,6 +1639,11 @@ namespace MvpLauncher
             {
                 lblRamValue.Text = $"{(int)e.NewValue} MB";
             }
+
+            if (!IsLoaded || _isLoadingSettings) return;
+
+            _settings.RamMb = (int)e.NewValue;
+            _settings.Save();
         }
 
         private void Theme_Checked(object sender, RoutedEventArgs e)
@@ -896,14 +1670,6 @@ namespace MvpLauncher
             {
                 _settings.Language = lang;
                 _settings.Save();
-                TranslationSource.Instance.Language = lang;
-
-                UpdateThemeDisplay();
-
-                if (!App.StartupStopwatch.IsRunning)
-                {
-                    lblStartupTime.Text = $"{T("StartupTime")}: {App.StartupStopwatch.ElapsedMilliseconds} ms";
-                }
             }
         }
 
@@ -949,14 +1715,29 @@ namespace MvpLauncher
                 case "G1GC":
                     args.Add("-XX:+UnlockExperimentalVMOptions");
                     args.Add("-XX:+UseG1GC");
-                    args.Add("-XX:G1NewSizePercent=20");
+                    args.Add("-XX:G1NewSizePercent=30");
+                    args.Add("-XX:G1MaxNewSizePercent=40");
+                    args.Add("-XX:G1HeapRegionSize=8M");
                     args.Add("-XX:G1ReservePercent=20");
-                    args.Add("-XX:MaxGCPauseMillis=50");
-                    args.Add("-XX:G1HeapRegionSize=32M");
+                    args.Add("-XX:G1HeapWastePercent=5");
+                    args.Add("-XX:G1MixedGCCountTarget=4");
+                    args.Add("-XX:InitiatingHeapOccupancyPercent=15");
+                    args.Add("-XX:G1MixedGCLiveThresholdPercent=90");
+                    args.Add("-XX:G1RSetUpdatingPauseTimePercent=5");
+                    args.Add("-XX:SurvivorRatio=32");
+                    args.Add("-XX:+PerfDisableSharedMem");
+                    args.Add("-XX:MaxTenuringThreshold=1");
+                    args.Add("-XX:+UseStringDeduplication");
+                    args.Add("-XX:+ParallelRefProcEnabled");
+                    args.Add("-XX:MaxGCPauseMillis=200");
                     break;
                 case "ZGC":
                     args.Add("-XX:+UnlockExperimentalVMOptions");
                     args.Add("-XX:+UseZGC");
+                    args.Add("-XX:+UseStringDeduplication");
+                    args.Add("-XX:+ParallelRefProcEnabled");
+                    args.Add("-XX:ZCollectionInterval=5");
+                    args.Add("-XX:ZAllocationSpikeTolerance=2");
                     break;
                 case "Custom":
                     if (!string.IsNullOrWhiteSpace(_settings.JavaArgs))
@@ -983,6 +1764,7 @@ namespace MvpLauncher
 
             _updateTimer.Tick += async (s, e) =>
             {
+                if (_isClosed) return;
                 await CheckForUpdatesAsync(showPopup: false);
             };
 
@@ -993,59 +1775,122 @@ namespace MvpLauncher
         {
             try
             {
-                var update = await _updateService.CheckAsync();
+                _velopack ??= new UpdateManager(new SimpleWebSource("https://github.com/Gabix-lab/MvpLauncher/releases/latest/download"));
 
-                if (update == null)
+                if (!_velopack.IsInstalled)
                 {
-                    _pendingUpdate = null;
+                    Debug.WriteLine("[Velopack] NEM TELEPITETT");
                     ShowUpdateBadge(false);
                     if (lblUpdateStatus != null)
+                        lblUpdateStatus.Text = "Nem telepített verzió";
+
+                    if (showPopup)
                     {
-                        lblUpdateStatus.Text = T("UpdateUpToDate");
-                    }
-                    if (lblUpdateVersion != null)
-                    {
-                        lblUpdateVersion.Visibility = Visibility.Collapsed;
-                    }
-                    if (lblUpdateBadge != null)
-                    {
-                        lblUpdateBadge.Visibility = Visibility.Collapsed;
+                        MessageBox.Show(
+                            "A launcher nincs Velopack-kal telepítve.\n\n" +
+                            $"Futó hely: {AppDomain.CurrentDomain.BaseDirectory}\n\n" +
+                            "Telepítsd a Setup.exe-vel, hogy automatikusan frissüljön.",
+                            "Frissítés info", MessageBoxButton.OK, MessageBoxImage.Information);
                     }
                     return;
                 }
 
-                _pendingUpdate = update;
-                ShowUpdateBadge(true);
+                if (showPopup && lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Frissítés keresése...";
 
-                if (lblUpdateStatus != null)
+                var newVersion = await _velopack.CheckForUpdatesAsync();
+
+                if (newVersion == null)
                 {
-                    lblUpdateStatus.Text = T("UpdateAvailable");
+                    Debug.WriteLine($"[Velopack] Nincs új verzió (fut: v{AppVersion})");
+                    ShowUpdateBadge(false);
+                    if (lblUpdateStatus != null)
+                        lblUpdateStatus.Text = "A launcher naprakész.";
+                    if (lblUpdateVersion != null)
+                        lblUpdateVersion.Visibility = Visibility.Collapsed;
+                    if (lblUpdateBadge != null)
+                        lblUpdateBadge.Visibility = Visibility.Collapsed;
+
+                    if (showPopup)
+                    {
+                        MessageBox.Show(
+                            $"A launcher naprakész.\n\nFutó verzió: v{AppVersion}",
+                            "Frissítés", MessageBoxButton.OK, MessageBoxImage.Information);
+                    }
+                    return;
                 }
+
+                var newVer = newVersion.TargetFullRelease.Version.ToString();
+                Debug.WriteLine($"[Velopack] Új verzió elérhető: {newVer}");
+
+                ShowUpdateBadge(true);
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Új verzió elérhető";
                 if (lblUpdateVersion != null)
                 {
-                    lblUpdateVersion.Text = string.Format(T("UpdateAvailableShort"), update.Version);
+                    lblUpdateVersion.Text = $"Új verzió: {newVer}";
                     lblUpdateVersion.Visibility = Visibility.Visible;
                 }
                 if (lblUpdateBadge != null)
-                {
                     lblUpdateBadge.Visibility = Visibility.Visible;
-                }
+
+                if (!showPopup) return;
+
+                var result = MessageBox.Show(
+                    $"Új verzió érhető el: {newVer}\n\nJelenlegi: v{AppVersion}\n\nTelepíted most? A launcher újraindul.",
+                    "MVP Launcher frissítés",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+
+                if (result != MessageBoxResult.Yes) return;
+
+                await DownloadAndApplyAsync(newVersion);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Velopack] HIBA: {ex}");
+
+                ShowUpdateBadge(false);
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Nem sikerült ellenőrizni a frissítést.";
 
                 if (showPopup)
                 {
-                    var window = new UpdateWindow(update, _updateService)
-                    {
-                        Owner = this
-                    };
-                    window.ShowDialog();
+                    MessageBox.Show(
+                        $"Frissítés ellenőrzés sikertelen:\n\n" +
+                        $"Hiba: {ex.Message}\n" +
+                        $"Típus: {ex.GetType().Name}\n\n" +
+                        $"Ha ez ismétlődik, töltsd le kézzel:\n{GithubRepoUrl}/releases/latest",
+                        "Frissítés hiba",
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
                 }
             }
-            catch
+        }
+
+        private async Task DownloadAndApplyAsync(UpdateInfo veloUpdate)
+        {
+            if (_velopack == null) return;
+
+            try
             {
-                if (showPopup && lblUpdateStatus != null)
+                SetUIEnabled(false);
+                if (lblStatus != null) lblStatus.Text = "Frissítés letöltése...";
+                SetProgress(0, smooth: false);
+
+                await _velopack.DownloadUpdatesAsync(veloUpdate, pct =>
                 {
-                    lblUpdateStatus.Text = T("UpdateCheckError");
-                }
+                    _ = Dispatcher.InvokeAsync(() => SetProgress(pct));
+                });
+
+                _velopack.ApplyUpdatesAndRestart(veloUpdate);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Frissítés letöltése sikertelen:\n\n{ex.Message}\n\n" +
+                    $"Töltsd le kézzel:\n{GithubRepoUrl}/releases/latest",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+                SetUIEnabled(true);
             }
         }
 
@@ -1068,23 +1913,180 @@ namespace MvpLauncher
         private async void BtnCheckUpdate_Click(object sender, RoutedEventArgs e)
         {
             btnCheckUpdate.IsEnabled = false;
-            if (lblUpdateStatus != null)
+            try
             {
-                lblUpdateStatus.Text = T("UpdateChecking");
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Frissítés keresése...";
+
+                await CheckForUpdatesAsync(showPopup: true);
+            }
+            finally
+            {
+                btnCheckUpdate.IsEnabled = true;
+            }
+        }
+
+        private async void BtnForceUpdate_Click(object sender, RoutedEventArgs e)
+        {
+            bool isInstalled = false;
+            try
+            {
+                _velopack ??= new UpdateManager(new SimpleWebSource("https://github.com/Gabix-lab/MvpLauncher/releases/latest/download"));
+                isInstalled = _velopack.IsInstalled;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ForceUpdate] Telepítettség ellenőrzése sikertelen: {ex.Message}");
             }
 
-            await CheckForUpdatesAsync(showPopup: false);
-
-            if (_pendingUpdate != null)
+            if (!isInstalled)
             {
-                var window = new UpdateWindow(_pendingUpdate, _updateService)
+                var portableAnswer = MessageBox.Show(
+                    "Úgy tűnik, a launcher nincs Setup.exe-vel telepítve (portable módban fut).\n\n" +
+                    "A kényszerített frissítés letölti és elindítja a legújabb telepítőt, ami feltelepíti a programot a rendszerre.\n" +
+                    "A jelenlegi portable mappád érintetlen marad.\n\n" +
+                    "Szeretnéd folytatni?",
+                    "Portable verzió észlelve",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+
+                if (portableAnswer != MessageBoxResult.Yes) return;
+            }
+
+            var result = MessageBox.Show(
+                "Ez a művelet letölti és elindítja a legújabb (vagy GitHubon 'Latest'-nek jelölt) telepítőt.\n\n" +
+                "A folyamat felülírja a jelenlegi telepítést. Folytatod?",
+                "Kényszerített frissítés",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (result != MessageBoxResult.Yes) return;
+
+            if (btnForceUpdate != null) btnForceUpdate.IsEnabled = false;
+            if (btnCheckUpdate != null) btnCheckUpdate.IsEnabled = false;
+
+            try
+            {
+                string setupUrl = "https://github.com/Gabix-lab/MvpLauncher/releases/latest/download/MvpLauncher-win-Setup.exe";
+                string tempPath = Path.Combine(Path.GetTempPath(), "MvpLauncher-update-Setup.exe");
+
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Telepítő letöltése...";
+
+                using (var client = new HttpClient())
                 {
-                    Owner = this
-                };
-                window.ShowDialog();
-            }
+                    client.DefaultRequestHeaders.Add("User-Agent", "MvpLauncher-ForceUpdate");
 
-            btnCheckUpdate.IsEnabled = true;
+                    using (var response = await client.GetAsync(setupUrl, HttpCompletionOption.ResponseHeadersRead))
+                    {
+                        response.EnsureSuccessStatusCode();
+                        var totalBytes = response.Content.Headers.ContentLength ?? -1L;
+
+                        using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                        using (var stream = await response.Content.ReadAsStreamAsync())
+                        {
+                            var buffer = new byte[8192];
+                            long totalRead = 0;
+                            int read;
+                            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await fs.WriteAsync(buffer, 0, read);
+                                totalRead += read;
+                                if (totalBytes > 0)
+                                {
+                                    double pct = (double)totalRead / totalBytes * 100;
+                                    await Dispatcher.InvokeAsync(() => SetProgress(pct));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Telepítő indítása...";
+
+                await Task.Delay(500);
+
+                _ = Process.Start(new ProcessStartInfo
+                {
+                    FileName = tempPath,
+                    UseShellExecute = true
+                });
+
+                Application.Current.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Hiba a kényszerített frissítés során:\n\n{ex.Message}\n\n" +
+                                $"Ha a hiba ismétlődik, töltsd le kézzel:\n{GithubRepoUrl}/releases/latest",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+
+                if (lblUpdateStatus != null)
+                    lblUpdateStatus.Text = "Kényszerített frissítés sikertelen.";
+
+                if (btnForceUpdate != null) btnForceUpdate.IsEnabled = true;
+                if (btnCheckUpdate != null) btnCheckUpdate.IsEnabled = true;
+            }
+        }
+
+        private void BtnOpenModsFolder_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (!Directory.Exists(_modsFolder))
+                {
+                    Directory.CreateDirectory(_modsFolder);
+                }
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = _modsFolder,
+                    UseShellExecute = true,
+                    Verb = "open"
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Nem sikerült megnyitni a mappát: {ex.Message}",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async void BtnInstallJava_Click(object sender, RoutedEventArgs e)
+        {
+            if (btnInstallJava != null) btnInstallJava.IsEnabled = false;
+            try
+            {
+                if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath))
+                {
+                    var version = JavaManager.GetJavaMajorVersion(_javaPath);
+                    var folder = Path.GetFileName(
+                        Path.GetDirectoryName(Path.GetDirectoryName(_javaPath) ?? "") ?? "");
+
+                    if (lblStatus != null)
+                    {
+                        if (version.HasValue && !string.IsNullOrEmpty(folder))
+                            lblStatus.Text = $"Java megtalálva: Java {version.Value} ({folder})";
+                        else if (version.HasValue)
+                            lblStatus.Text = $"Java megtalálva: Java {version.Value}";
+                        else
+                            lblStatus.Text = "Java megtalálva";
+                    }
+                    return;
+                }
+
+                bool ok = await EnsureJavaAsync();
+                if (!ok && lblStatus != null)
+                    lblStatus.Text = "A Java telepítése sikertelen";
+            }
+            catch (Exception ex)
+            {
+                if (lblStatus != null) lblStatus.Text = $"Hiba: {ex.Message}";
+            }
+            finally
+            {
+                if (btnInstallJava != null) btnInstallJava.IsEnabled = true;
+            }
         }
 
         private void Window_DragOver(object sender, DragEventArgs e)
@@ -1121,68 +2123,69 @@ namespace MvpLauncher
                 EnsureModsFolderExists();
 
                 int imported = 0;
+                var importedNames = new List<string>();
 
                 foreach (var file in files)
                 {
                     if (!file.EndsWith(".jar", StringComparison.OrdinalIgnoreCase))
-                    {
                         continue;
-                    }
 
                     try
                     {
                         var fileName = Path.GetFileName(file);
                         var destPath = Path.Combine(_modsFolder, fileName);
                         File.Copy(file, destPath, true);
+
+                        var disabledPath = destPath + ".disabled";
+                        if (File.Exists(disabledPath))
+                        {
+                            try { File.Delete(disabledPath); } catch { }
+                        }
+
                         imported++;
+                        importedNames.Add(fileName);
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Drop] '{file}' másolási hiba: {ex.Message}");
+                    }
                 }
 
                 if (imported > 0)
                 {
+                    AddModsToCurrentInstance(importedNames);
                     LoadMods();
-                    lblStatus.Text = string.Format(T("ModsImported"), imported);
+                    if (lblStatus != null) lblStatus.Text = $"{imported} mod importálva";
                 }
             }
             catch (Exception ex)
             {
-                lblStatus.Text = $"{T("Error")}: {ex.Message}";
+                if (lblStatus != null) lblStatus.Text = $"Hiba: {ex.Message}";
             }
         }
 
-        private void ShowOnly(UIElement view)
-        {
-            MainView.Visibility = view == MainView ? Visibility.Visible : Visibility.Collapsed;
-            ModsView.Visibility = view == ModsView ? Visibility.Visible : Visibility.Collapsed;
-            SettingsView.Visibility = view == SettingsView ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private void BtnToggleMods_Click(object sender, RoutedEventArgs e)
+        private async void BtnToggleMods_Click(object sender, RoutedEventArgs e)
         {
             if (ModsView.Visibility == Visibility.Visible)
             {
-                ShowOnly(MainView);
+                await ShowOnlyAsync(MainView);
                 txtModrinthSearch.Text = "";
                 ModrinthResults.Clear();
                 ModrinthVersions.Clear();
+                SelectedModrinthItem = null;
             }
             else
             {
-                ShowOnly(ModsView);
+                await ShowOnlyAsync(ModsView);
             }
         }
 
-        private void BtnSettings_Click(object sender, RoutedEventArgs e)
+        private async void BtnSettings_Click(object sender, RoutedEventArgs e)
         {
             if (SettingsView.Visibility == Visibility.Visible)
-            {
-                ShowOnly(MainView);
-            }
+                await ShowOnlyAsync(MainView);
             else
-            {
-                ShowOnly(SettingsView);
-            }
+                await ShowOnlyAsync(SettingsView);
         }
 
         private void TxtMultiCount_TextChanged(object sender, TextChangedEventArgs e)
@@ -1269,7 +2272,7 @@ namespace MvpLauncher
         private void SyncMultiCountBox()
         {
             _updatingMultiCount = true;
-            txtMultiCount.Text = MultiLaunchInstances.Count.ToString();
+            if (txtMultiCount != null) txtMultiCount.Text = MultiLaunchInstances.Count.ToString();
             _updatingMultiCount = false;
         }
 
@@ -1412,16 +2415,21 @@ namespace MvpLauncher
             {
                 ModrinthResults.Clear();
                 ModrinthVersions.Clear();
-                lblModrinthStatus.Text = "";
-                lblModrinthEmpty.Text = T("ModrinthEmpty");
-                lblModrinthEmpty.Visibility = Visibility.Visible;
+                SelectedModrinthItem = null;
+                if (lblModrinthStatus != null) lblModrinthStatus.Text = "";
+                if (lblModrinthEmpty != null)
+                {
+                    lblModrinthEmpty.Text = "Keress modokat a fenti mezővel.";
+                    lblModrinthEmpty.Visibility = Visibility.Visible;
+                }
                 return;
             }
 
-            lblModrinthStatus.Text = T("Searching");
+            if (lblModrinthStatus != null) lblModrinthStatus.Text = "Keresés...";
             ModrinthResults.Clear();
             ModrinthVersions.Clear();
-            lblModrinthEmpty.Visibility = Visibility.Collapsed;
+            SelectedModrinthItem = null;
+            if (lblModrinthEmpty != null) lblModrinthEmpty.Visibility = Visibility.Collapsed;
 
             try
             {
@@ -1441,14 +2449,17 @@ namespace MvpLauncher
                     });
                 }
 
-                lblModrinthStatus.Text = $"{ModrinthResults.Count} {T("Results")}";
-                lblModrinthEmpty.Visibility = ModrinthResults.Count == 0
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
+                if (lblModrinthStatus != null) lblModrinthStatus.Text = $"{ModrinthResults.Count} találat";
+                if (lblModrinthEmpty != null)
+                {
+                    lblModrinthEmpty.Visibility = ModrinthResults.Count == 0
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                }
             }
             catch (Exception ex)
             {
-                lblModrinthStatus.Text = $"{T("Error")}: {ex.Message}";
+                if (lblModrinthStatus != null) lblModrinthStatus.Text = $"Hiba: {ex.Message}";
             }
         }
 
@@ -1463,25 +2474,7 @@ namespace MvpLauncher
         {
             if (sender is not FrameworkElement el) return;
             if (el.DataContext is not ModrinthItem item) return;
-
-            lblModrinthStatus.Text = $"{item.Title} {T("LoadingVersions")}";
-            ModrinthVersions.Clear();
-
-            try
-            {
-                var versions = await _modrinth.GetVersionsAsync(item.ProjectId, "1.19.4", "fabric");
-
-                foreach (var v in versions)
-                {
-                    ModrinthVersions.Add(v);
-                }
-
-                lblModrinthStatus.Text = $"{item.Title}: {ModrinthVersions.Count} {T("Versions")}";
-            }
-            catch (Exception ex)
-            {
-                lblModrinthStatus.Text = $"{T("Error")}: {ex.Message}";
-            }
+            SelectedModrinthItem = item;
         }
 
         private async void BtnDownloadVersion_Click(object sender, RoutedEventArgs e)
@@ -1489,84 +2482,77 @@ namespace MvpLauncher
             if (sender is not FrameworkElement el) return;
             if (el.Tag is not ModrinthVersion version) return;
 
-            btnModrinthSearch.IsEnabled = false;
+            Button? btn = el as Button;
+            if (btn != null) btn.IsEnabled = false;
+            if (btnModrinthSearch != null) btnModrinthSearch.IsEnabled = false;
 
-            var progress = new Progress<string>(msg => lblModrinthStatus.Text = msg);
-
-            string? downloaded = await _modrinth.DownloadModAsync(version, _modsFolder, progress);
-
-            if (downloaded != null)
+            try
             {
-                lblModrinthStatus.Text = $"{T("Downloaded")}: {Path.GetFileName(downloaded)}";
-                LoadMods();
-            }
-            else
-            {
-                lblModrinthStatus.Text = T("DownloadFailed");
-            }
+                var progress = new Progress<string>(msg => { if (lblModrinthStatus != null) lblModrinthStatus.Text = msg; });
+                string? downloaded = await _modrinth.DownloadModAsync(version, _modsFolder, progress);
 
-            btnModrinthSearch.IsEnabled = true;
+                if (downloaded != null)
+                {
+                    var downloadedName = Path.GetFileName(downloaded);
+
+                    var disabledPath = downloaded + ".disabled";
+                    if (File.Exists(disabledPath))
+                    {
+                        try { File.Delete(disabledPath); } catch { }
+                    }
+
+                    AddModsToCurrentInstance(new[] { downloadedName });
+
+                    if (lblModrinthStatus != null) lblModrinthStatus.Text = $"Letöltve: {downloadedName}";
+                    LoadMods();
+                }
+                else
+                {
+                    if (lblModrinthStatus != null) lblModrinthStatus.Text = "Letöltés sikertelen";
+                }
+            }
+            catch (Exception ex)
+            {
+                if (lblModrinthStatus != null) lblModrinthStatus.Text = $"Hiba: {ex.Message}";
+            }
+            finally
+            {
+                if (btn != null) btn.IsEnabled = true;
+                if (btnModrinthSearch != null) btnModrinthSearch.IsEnabled = true;
+            }
         }
 
         private async Task<bool> EnsureJavaAsync()
         {
-            if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath))
-            {
+            if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath) && JavaManager.IsVersionSufficient(_javaPath))
                 return true;
-            }
 
             _javaPath = JavaManager.FindJava();
-
             if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath))
-            {
                 return true;
+
+            if (lblStatus != null) lblStatus.Text = "Java 17 automatikus előkészítése...";
+            SetProgress(0, smooth: false);
+
+            try
+            {
+                var result = await JavaManager.EnsureJavaAsync();
+
+                if (!string.IsNullOrEmpty(result) && File.Exists(result))
+                {
+                    _javaPath = result;
+                    if (lblStatus != null) lblStatus.Text = "Java sikeresen telepítve";
+                    SetProgress(100);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Java] Telepítési hiba: {ex.Message}");
             }
 
-            var result = MessageBox.Show(
-                T("JavaNotFoundMessage"),
-                T("JavaNotFound"),
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Question);
-
-            if (result != MessageBoxResult.Yes)
-            {
-                return false;
-            }
-
-            SetUIEnabled(false);
-            lblStatus.Text = T("JavaDownloading");
-            progressBar.Value = 0;
-
-            var progress = new Progress<int>(pct =>
-            {
-                progressBar.Value = pct;
-                lblPercent.Text = $"{pct}%";
-            });
-
-            var installedJava = await JavaManager.DownloadAndInstallAsync(progress);
-
-            if (string.IsNullOrEmpty(installedJava) || !File.Exists(installedJava))
-            {
-                MessageBox.Show(
-                    T("JavaInstallFailedMessage"),
-                    T("JavaInstallFailed"),
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error);
-
-                lblStatus.Text = T("JavaInstallFailed");
-                SetUIEnabled(true);
-                return false;
-            }
-
-            _javaPath = installedJava;
-            lblStatus.Text = T("JavaInstalled");
-
-            progressBar.Value = 100;
-            lblPercent.Text = "100%";
-
-            SetUIEnabled(true);
-
-            return true;
+            if (lblStatus != null) lblStatus.Text = "A Java telepítése sikertelen";
+            return false;
         }
 
         private void BtnCopySystemInfo_Click(object sender, RoutedEventArgs e)
@@ -1576,7 +2562,7 @@ namespace MvpLauncher
                 var sb = new System.Text.StringBuilder();
 
                 sb.AppendLine("=== MVP Launcher System Info ===");
-                sb.AppendLine($"Launcher version: {UpdateService.CurrentVersion}");
+                sb.AppendLine($"Launcher version: {AppVersion}");
                 sb.AppendLine($"OS: {Environment.OSVersion}");
                 sb.AppendLine($"OS Architecture: {(Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit")}");
                 sb.AppendLine($"Machine: {Environment.MachineName}");
@@ -1619,17 +2605,30 @@ namespace MvpLauncher
                 sb.AppendLine($"Minecraft path: {_minecraftPath.BasePath}");
                 sb.AppendLine($"Mods count: {AllMods.Count}");
                 sb.AppendLine($"Selected profile: {_settings.SelectedProfile}");
+                sb.AppendLine($"Selected instance: {_settings.SelectedInstanceProfile}");
                 sb.AppendLine($"Theme: {_settings.Theme}");
                 sb.AppendLine($"Language: {_settings.Language}");
                 sb.AppendLine($"RAM: {_settings.RamMb} MB");
+
+                try
+                {
+                    var singleProfile = _settings.InstanceProfiles
+                        .FirstOrDefault(p => p.Name == SingleInstanceName);
+                    var multiProfile = _settings.InstanceProfiles
+                        .FirstOrDefault(p => p.Name == MultiInstanceName);
+                    sb.AppendLine($"Single mods count: {singleProfile?.EnabledMods?.Count ?? 0}");
+                    sb.AppendLine($"Multi mods count: {multiProfile?.EnabledMods?.Count ?? 0}");
+                }
+                catch { }
+
                 sb.AppendLine("=== End ===");
 
                 Clipboard.SetText(sb.ToString());
-                lblStatus.Text = T("AboutSystemInfoCopied");
+                if (lblStatus != null) lblStatus.Text = "Rendszerinformáció a vágólapra másolva!";
             }
             catch (Exception ex)
             {
-                lblStatus.Text = $"{T("Error")}: {ex.Message}";
+                if (lblStatus != null) lblStatus.Text = $"Hiba: {ex.Message}";
             }
         }
 
@@ -1643,19 +2642,24 @@ namespace MvpLauncher
         {
             var launcher = new MinecraftLauncher(_minecraftPath);
 
+            bool skipProgress = ShouldSkipAssetProgress(fabricVersionName);
+
             launcher.FileProgressChanged += (s, args) =>
             {
+                if (skipProgress) return;
+
                 double pct = args.TotalTasks > 0
                     ? (double)args.ProgressedTasks / args.TotalTasks * 100.0
                     : 0;
 
-                Dispatcher.Invoke(() =>
+                _ = Dispatcher.InvokeAsync(() =>
                 {
-                    progressBar.Value = pct;
-                    lblPercent.Text = $"{pct:0}%";
-                    lblStatus.Text = string.IsNullOrEmpty(args.Name)
-                        ? T("Downloading")
-                        : $"{T("Downloading")}: {args.Name}";
+                    if (progressBar != null) progressBar.Value = pct;
+                    if (lblPercent != null) lblPercent.Text = $"{pct:0}%";
+                    if (lblStatus != null)
+                        lblStatus.Text = string.IsNullOrEmpty(args.Name)
+                            ? "Letöltés"
+                            : $"Letöltés: {args.Name}";
                 });
             };
 
@@ -1674,12 +2678,12 @@ namespace MvpLauncher
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[MultiLaunch] Auth hiba ({accountName}): {ex.Message}");
+                    Debug.WriteLine($"[MultiLaunch] Auth hiba ({accountName}): {ex.Message}");
                 }
             }
 
             if (session == null)
-                session = MSession.CreateOfflineSession(username);
+                session = MSession.CreateOfflineSession(username)!;
 
             string javaPathForLaunch = _javaPath ?? "";
             if (!string.IsNullOrEmpty(javaPathForLaunch) &&
@@ -1707,6 +2711,12 @@ namespace MvpLauncher
 
             var process = await launcher.CreateProcessAsync(fabricVersionName, launchOption);
 
+            if (process == null)
+                throw new InvalidOperationException("Nem sikerült létrehozni a játék folyamatot.");
+
+            if (!skipProgress)
+                MarkAssetsChecked(fabricVersionName);
+
             try
             {
                 process.StartInfo.CreateNoWindow = true;
@@ -1720,9 +2730,9 @@ namespace MvpLauncher
                 process.EnableRaisingEvents = true;
                 process.Exited += (s2, ev) =>
                 {
-                    Dispatcher.Invoke(() =>
+                    _ = Dispatcher.InvokeAsync(() =>
                     {
-                        _cacheManager.ClearCache();
+                        if (_isClosed) return;
 
                         if (behavior == "Close")
                         {
@@ -1733,12 +2743,12 @@ namespace MvpLauncher
                             Show();
                             WindowState = WindowState.Normal;
                             Activate();
-                            lblStatus.Text = T("GameClosed");
+                            if (lblStatus != null) lblStatus.Text = "A játék bezárult. Cache törölve.";
                             SetUIEnabled(true);
                         }
                         else
                         {
-                            lblStatus.Text = T("GameClosed");
+                            if (lblStatus != null) lblStatus.Text = "A játék bezárult. Cache törölve.";
                             SetUIEnabled(true);
                         }
                     });
@@ -1751,25 +2761,26 @@ namespace MvpLauncher
 
         private async void BtnLaunchMultiple_Click(object sender, RoutedEventArgs e)
         {
+            SwitchToInstance(MultiInstanceName);
+
             var instances = MultiLaunchInstances
                 .Where(i => !string.IsNullOrEmpty(i.SelectedAccount))
                 .ToList();
 
             if (instances.Count == 0)
             {
-                MessageBox.Show(T("MultiLaunchNoInstances"),
-                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("Adj hozzá legalább egy klienst!",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
             int ramMb = (int)sldRam.Value;
 
             SetUIEnabled(false);
-            btnLaunchMultiple.IsEnabled = false;
-            progressBar.Value = 0;
-            lblPercent.Text = "0%";
-            lblStatus.Text = T("Preparing");
-            lblGameStartupTime.Text = "";
+            if (btnLaunchMultiple != null) btnLaunchMultiple.IsEnabled = false;
+            SetProgress(0, smooth: false);
+            if (lblStatus != null) lblStatus.Text = "Előkészítés...";
+            if (lblGameStartupTime != null) lblGameStartupTime.Text = "";
 
             var gameStartupSw = Stopwatch.StartNew();
 
@@ -1777,16 +2788,16 @@ namespace MvpLauncher
             {
                 if (!await EnsureJavaAsync())
                 {
-                    lblStatus.Text = T("LaunchCancelled");
+                    if (lblStatus != null) lblStatus.Text = "Java nem elérhető — próbáld újra pár perc múlva.";
                     SetUIEnabled(true);
-                    btnLaunchMultiple.IsEnabled = true;
+                    if (btnLaunchMultiple != null) btnLaunchMultiple.IsEnabled = true;
                     return;
                 }
 
                 var cacheProgress = new Progress<string>(msg =>
                 {
-                    lblStatus.Text = msg;
-                    System.Diagnostics.Debug.WriteLine($"[CacheMod] {msg}");
+                    if (lblStatus != null) lblStatus.Text = msg;
+                    Debug.WriteLine($"[CacheMod] {msg}");
                 });
 
                 bool cacheOk = await _cacheManager.PrepareAsync(cacheProgress);
@@ -1794,25 +2805,22 @@ namespace MvpLauncher
                 if (!cacheOk)
                 {
                     var result = MessageBox.Show(
-                        T("CacheModFailed"),
-                        T("CacheModError"),
+                        "A cache mod letöltése sikertelen.\n\nEl akarod indítani a játékot cache mod nélkül?",
+                        "Cache mod hiba",
                         MessageBoxButton.YesNo,
                         MessageBoxImage.Warning);
 
                     if (result == MessageBoxResult.No)
                     {
-                        lblStatus.Text = T("LaunchCancelled");
+                        if (lblStatus != null) lblStatus.Text = "Indítás megszakítva.";
                         SetUIEnabled(true);
-                        btnLaunchMultiple.IsEnabled = true;
+                        if (btnLaunchMultiple != null) btnLaunchMultiple.IsEnabled = true;
                         return;
                     }
                 }
 
-                lblStatus.Text = T("InstallingFabric");
-                var fabricInstaller = new FabricInstaller(new HttpClient());
-                string fabricVersionName = await fabricInstaller.Install("1.19.4", _minecraftPath);
-
-                EnsureDefaultServerExists();
+                if (lblStatus != null) lblStatus.Text = "Fabric loader telepítése...";
+                string fabricVersionName = await GetOrInstallFabricVersionAsync();
 
                 int launched = 0;
 
@@ -1820,7 +2828,7 @@ namespace MvpLauncher
                 {
                     try
                     {
-                        lblStatus.Text = string.Format(T("MultiLaunchLaunching"), inst.SelectedAccount);
+                        if (lblStatus != null) lblStatus.Text = $"Indítás: {inst.SelectedAccount}...";
 
                         await CreateAndStartGameAsync(
                             inst.SelectedAccount,
@@ -1836,50 +2844,50 @@ namespace MvpLauncher
                     }
                     catch (Exception ex)
                     {
-                        System.Diagnostics.Debug.WriteLine(
+                        Debug.WriteLine(
                             $"[MultiLaunch] '{inst.SelectedAccount}' indítási hiba: {ex.Message}");
                     }
                 }
 
                 gameStartupSw.Stop();
-                lblGameStartupTime.Text =
-                    $"{T("GameStartupTime")}: {gameStartupSw.Elapsed.TotalSeconds:0.00} s";
+                if (lblGameStartupTime != null)
+                    lblGameStartupTime.Text = $"Játék indult: {gameStartupSw.Elapsed.TotalSeconds:0.00} s";
 
-                lblStatus.Text = string.Format(T("MultiLaunchClientStarted"), launched);
-                progressBar.Value = 100;
-                lblPercent.Text = "100%";
+                if (lblStatus != null) lblStatus.Text = $"{launched} kliens elindítva!";
+                SetProgress(100);
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"{T("LaunchError")}:\n{ex.Message}",
-                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Error);
-                lblStatus.Text = T("LaunchError");
+                MessageBox.Show($"Hiba történt az indításkor.:\n{ex.Message}",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (lblStatus != null) lblStatus.Text = "Hiba történt az indításkor.";
             }
             finally
             {
                 SetUIEnabled(true);
-                btnLaunchMultiple.IsEnabled = true;
+                if (btnLaunchMultiple != null) btnLaunchMultiple.IsEnabled = true;
             }
         }
 
         private async void BtnPlay_Click(object sender, RoutedEventArgs e)
         {
+            SwitchToInstance(SingleInstanceName);
+
             string username = _settings.SelectedProfile;
 
             if (string.IsNullOrEmpty(username))
             {
-                MessageBox.Show(T("ChooseProfile"),
-                    T("MissingName"), MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("Kérlek válassz vagy adj hozzá egy felhasználónevet!",
+                    "Hiányzó név", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
             int ramMb = (int)sldRam.Value;
 
             SetUIEnabled(false);
-            progressBar.Value = 0;
-            lblPercent.Text = "0%";
-            lblStatus.Text = T("Preparing");
-            lblGameStartupTime.Text = "";
+            SetProgress(0, smooth: false);
+            if (lblStatus != null) lblStatus.Text = "Előkészítés...";
+            if (lblGameStartupTime != null) lblGameStartupTime.Text = "";
 
             var gameStartupSw = Stopwatch.StartNew();
 
@@ -1887,15 +2895,15 @@ namespace MvpLauncher
             {
                 if (!await EnsureJavaAsync())
                 {
-                    lblStatus.Text = T("LaunchCancelled");
+                    if (lblStatus != null) lblStatus.Text = "Java nem elérhető — próbáld újra pár perc múlva.";
                     SetUIEnabled(true);
                     return;
                 }
 
                 var cacheProgress = new Progress<string>(msg =>
                 {
-                    lblStatus.Text = msg;
-                    System.Diagnostics.Debug.WriteLine($"[CacheMod] {msg}");
+                    if (lblStatus != null) lblStatus.Text = msg;
+                    Debug.WriteLine($"[CacheMod] {msg}");
                 });
 
                 bool cacheOk = await _cacheManager.PrepareAsync(cacheProgress);
@@ -1903,26 +2911,23 @@ namespace MvpLauncher
                 if (!cacheOk)
                 {
                     var result = MessageBox.Show(
-                        T("CacheModFailed"),
-                        T("CacheModError"),
+                        "A cache mod letöltése sikertelen.\n\nEl akarod indítani a játékot cache mod nélkül?",
+                        "Cache mod hiba",
                         MessageBoxButton.YesNo,
                         MessageBoxImage.Warning);
 
                     if (result == MessageBoxResult.No)
                     {
-                        lblStatus.Text = T("LaunchCancelled");
+                        if (lblStatus != null) lblStatus.Text = "Indítás megszakítva.";
                         SetUIEnabled(true);
                         return;
                     }
                 }
 
-                lblStatus.Text = T("InstallingFabric");
-                var fabricInstaller = new FabricInstaller(new HttpClient());
-                string fabricVersionName = await fabricInstaller.Install("1.19.4", _minecraftPath);
+                if (lblStatus != null) lblStatus.Text = "Fabric loader telepítése...";
+                string fabricVersionName = await GetOrInstallFabricVersionAsync();
 
-                lblStatus.Text = T("LoggingIn");
-
-                EnsureDefaultServerExists();
+                if (lblStatus != null) lblStatus.Text = "Bejelentkezés...";
 
                 string behavior = _settings.LauncherBehavior;
 
@@ -1950,14 +2955,14 @@ namespace MvpLauncher
                     catch (Exception ex)
                     {
                         var result = MessageBox.Show(
-                            $"{T("MicrosoftSessionError")}:\n{ex.Message}\n\n{T("ContinueOffline")}",
-                            T("LoginError"),
+                            $"Microsoft bejelentkezés sikertelen:\n{ex.Message}\n\nOffline módban folytatod?",
+                            "Bejelentkezés hiba",
                             MessageBoxButton.YesNo,
                             MessageBoxImage.Warning);
 
                         if (result == MessageBoxResult.No)
                         {
-                            lblStatus.Text = T("LaunchCancelled");
+                            if (lblStatus != null) lblStatus.Text = "Indítás megszakítva.";
                             SetUIEnabled(true);
                             return;
                         }
@@ -1966,10 +2971,10 @@ namespace MvpLauncher
 
                 if (session == null)
                 {
-                    session = MSession.CreateOfflineSession(username);
+                    session = MSession.CreateOfflineSession(username)!;
                 }
 
-                lblStatus.Text = T("LaunchingGame");
+                if (lblStatus != null) lblStatus.Text = "Játék indítása...";
 
                 string javaPathForLaunch = _javaPath ?? "";
                 if (!string.IsNullOrEmpty(javaPathForLaunch) &&
@@ -2001,23 +3006,35 @@ namespace MvpLauncher
 
                 var launcher = new MinecraftLauncher(_minecraftPath);
 
+                bool skipProgress = ShouldSkipAssetProgress(fabricVersionName);
+
                 launcher.FileProgressChanged += (s, args) =>
                 {
+                    if (skipProgress) return;
+
                     double pct = args.TotalTasks > 0
                         ? (double)args.ProgressedTasks / args.TotalTasks * 100.0
                         : 0;
 
-                    Dispatcher.Invoke(() =>
+                    _ = Dispatcher.InvokeAsync(() =>
                     {
-                        progressBar.Value = pct;
-                        lblPercent.Text = $"{pct:0}%";
-                        lblStatus.Text = string.IsNullOrEmpty(args.Name)
-                            ? T("Downloading")
-                            : $"{T("Downloading")}: {args.Name}";
+                        if (progressBar != null) progressBar.Value = pct;
+                        if (lblPercent != null) lblPercent.Text = $"{pct:0}%";
+                        if (lblStatus != null)
+                            lblStatus.Text = string.IsNullOrEmpty(args.Name)
+                                ? "Letöltés"
+                                : $"Letöltés: {args.Name}";
                     });
                 };
 
                 var process = await launcher.CreateProcessAsync(fabricVersionName, launchOption);
+
+                if (process == null)
+                    throw new InvalidOperationException("Nem sikerült létrehozni a játék folyamatot.");
+
+                if (!skipProgress)
+                    MarkAssetsChecked(fabricVersionName);
+
                 process.EnableRaisingEvents = true;
 
                 try
@@ -2030,9 +3047,9 @@ namespace MvpLauncher
 
                 process.Exited += (s2, ev) =>
                 {
-                    Dispatcher.Invoke(() =>
+                    _ = Dispatcher.InvokeAsync(() =>
                     {
-                        _cacheManager.ClearCache();
+                        if (_isClosed) return;
 
                         if (behavior == "Close")
                         {
@@ -2043,12 +3060,12 @@ namespace MvpLauncher
                             Show();
                             WindowState = WindowState.Normal;
                             Activate();
-                            lblStatus.Text = T("GameClosed");
+                            if (lblStatus != null) lblStatus.Text = "A játék bezárult. Cache törölve.";
                             SetUIEnabled(true);
                         }
                         else
                         {
-                            lblStatus.Text = T("GameClosed");
+                            if (lblStatus != null) lblStatus.Text = "A játék bezárult. Cache törölve.";
                             SetUIEnabled(true);
                         }
                     });
@@ -2057,11 +3074,11 @@ namespace MvpLauncher
                 process.Start();
 
                 gameStartupSw.Stop();
-                lblGameStartupTime.Text = $"{T("GameStartupTime")}: {gameStartupSw.Elapsed.TotalSeconds:0.00} s";
+                if (lblGameStartupTime != null)
+                    lblGameStartupTime.Text = $"Játék indult: {gameStartupSw.Elapsed.TotalSeconds:0.00} s";
 
-                lblStatus.Text = T("GameLaunched");
-                progressBar.Value = 100;
-                lblPercent.Text = "100%";
+                if (lblStatus != null) lblStatus.Text = "A játék sikeresen elindult! Jó szórakozást!";
+                SetProgress(100);
 
                 if (behavior == "Close" || behavior == "Hide")
                 {
@@ -2070,27 +3087,45 @@ namespace MvpLauncher
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"{T("LaunchError")}:\n{ex.Message}",
-                    T("Error"), MessageBoxButton.OK, MessageBoxImage.Error);
-                lblStatus.Text = T("LaunchError");
+                MessageBox.Show($"Hiba történt az indításkor.:\n{ex.Message}",
+                    "Hiba", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (lblStatus != null) lblStatus.Text = "Hiba történt az indításkor.";
                 SetUIEnabled(true);
             }
         }
 
+        private async void BtnHome_Click(object sender, RoutedEventArgs e)
+        {
+            if (MainView.Visibility == Visibility.Visible) return;
+
+            await ShowOnlyAsync(MainView);
+
+            if (txtModrinthSearch != null) txtModrinthSearch.Text = "";
+            ModrinthResults.Clear();
+            ModrinthVersions.Clear();
+            SelectedModrinthItem = null;
+        }
+
         private void SetUIEnabled(bool enabled)
         {
-            btnPlay.IsEnabled = enabled;
-            btnToggleMods.IsEnabled = enabled;
-            btnSettings.IsEnabled = enabled;
-            cmbProfiles.IsEnabled = enabled;
-            btnAddProfile.IsEnabled = enabled;
-            btnAddMicrosoft.IsEnabled = enabled;
-            btnModrinthSearch.IsEnabled = enabled;
-            btnCheckUpdate.IsEnabled = enabled;
-            if (btnDeleteProfile != null)
-                btnDeleteProfile.IsEnabled = enabled;
-            if (btnLaunchMultiple != null)
-                btnLaunchMultiple.IsEnabled = enabled;
+            if (btnPlay != null) btnPlay.IsEnabled = enabled;
+            if (btnToggleMods != null) btnToggleMods.IsEnabled = enabled;
+            if (btnSettings != null) btnSettings.IsEnabled = enabled;
+            if (cmbProfiles != null) cmbProfiles.IsEnabled = enabled;
+            if (btnAddProfile != null) btnAddProfile.IsEnabled = enabled;
+            if (btnAddMicrosoft != null) btnAddMicrosoft.IsEnabled = enabled;
+            if (btnModrinthSearch != null) btnModrinthSearch.IsEnabled = enabled;
+            if (btnCheckUpdate != null) btnCheckUpdate.IsEnabled = enabled;
+            if (cmbInstanceSelector != null) cmbInstanceSelector.IsEnabled = enabled;
+            if (btnDeleteProfile != null) btnDeleteProfile.IsEnabled = enabled;
+            if (btnLaunchMultiple != null) btnLaunchMultiple.IsEnabled = enabled;
+            if (btnInstallJava != null) btnInstallJava.IsEnabled = enabled;
+            if (btnOpenModsFolder != null) btnOpenModsFolder.IsEnabled = enabled;
+        }
+
+        protected void OnPropertyChanged(string? name = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
         }
     }
 }

@@ -1,6 +1,4 @@
-﻿using System;
-
-namespace MvpLauncher
+﻿namespace MvpLauncher
 {
     public static class SkinService
     {

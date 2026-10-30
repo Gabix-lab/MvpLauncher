@@ -15,7 +15,6 @@ namespace MvpLauncher
         {
             var binding = new Binding($"[{Key}]")
             {
-                Source = TranslationSource.Instance,
                 Mode = BindingMode.OneWay
             };
 

@@ -1,47 +1,158 @@
-﻿using System;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Text.Json;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 
 namespace MvpLauncher
 {
     public static class JavaManager
     {
-        private const string AdoptiumApiUrl =
-            "https://api.adoptium.net/v3/assets/latest/17/hotspot" +
-            "?architecture=x64&image_type=jre&os=windows&vendor=eclipse&heap_size=normal";
+        public const int RequiredMajorVersion = 17;
 
-        public static string GetBundledJavaFolder()
+        private static readonly string[] AdoptiumApis =
         {
-            return Path.Combine(
+            "https://api.adoptium.net/v3/assets/latest/17/hotspot?architecture=x64&image_type=jre&os=windows&vendor=eclipse&heap_size=normal",
+            "https://api.adoptium.net/v3/assets/latest/17/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse&heap_size=normal",
+            "https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&image_type=jre&os=windows&vendor=eclipse&heap_size=normal",
+        };
+
+        private static readonly string[] DirectZipUrls =
+        {
+            "https://corretto.aws/downloads/latest/amazon-corretto-17-x64-windows-jdk.zip",
+            "https://aka.ms/download-jdk/microsoft-jdk-17-windows-x64.zip",
+        };
+
+        private static readonly object _installLock = new();
+        private static Task<string?>? _installTask;
+        private static string? _cachedPath;
+        private static string? _cachedPathFromDisk;
+
+        public static event EventHandler<string?>? JavaReady;
+        public static event EventHandler<int>? InstallProgress;
+        public static event EventHandler<bool>? InstallStateChanged;
+
+        public static bool IsInstalling
+        {
+            get
+            {
+                lock (_installLock) { return _installTask != null && !_installTask.IsCompleted; }
+            }
+        }
+
+        public static string GetBundledJavaFolder() =>
+            Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 ".mvplauncher",
                 "java");
+
+        private static string GetCacheFilePath() =>
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                ".mvplauncher",
+                "java-path.cache");
+
+        private static string? TryReadCachedPath()
+        {
+            try
+            {
+                if (_cachedPathFromDisk != null) return _cachedPathFromDisk;
+                var file = GetCacheFilePath();
+                if (File.Exists(file))
+                {
+                    var path = File.ReadAllText(file).Trim();
+                    if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                    {
+                        var ver = GetJavaMajorVersion(path);
+                        if (ver.HasValue && ver.Value >= RequiredMajorVersion)
+                        {
+                            _cachedPathFromDisk = path;
+                            return path;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
-        public static string? FindJava()
+        private static void CachePath(string path)
         {
+            _cachedPath = path;
+            _cachedPathFromDisk = path;
+            try
+            {
+                var file = GetCacheFilePath();
+                var dir = Path.GetDirectoryName(file);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(file, path);
+            }
+            catch { }
+        }
+
+        public static int? GetJavaMajorVersion(string javaPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(javaPath) || !File.Exists(javaPath)) return null;
+                var psi = new ProcessStartInfo
+                {
+                    FileName = javaPath,
+                    Arguments = "-version",
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var proc = Process.Start(psi);
+                if (proc == null) return null;
+                if (!proc.WaitForExit(5000))
+                {
+                    try { proc.Kill(); } catch { }
+                    return null;
+                }
+                string output = proc.StandardError.ReadToEnd();
+                if (string.IsNullOrEmpty(output)) output = proc.StandardOutput.ReadToEnd();
+                if (string.IsNullOrEmpty(output)) return null;
+                var match = Regex.Match(output, @"version\s+""?(\d+)");
+                if (match.Success && int.TryParse(match.Groups[1].Value, out int major))
+                    return major;
+            }
+            catch { }
+            return null;
+        }
+
+        public static bool IsVersionSufficient(string javaPath, int minMajorVersion = RequiredMajorVersion)
+        {
+            var ver = GetJavaMajorVersion(javaPath);
+            return ver.HasValue && ver.Value >= minMajorVersion;
+        }
+
+        public static string? FindJava(int minMajorVersion = RequiredMajorVersion)
+        {
+            var cached = _cachedPath ?? TryReadCachedPath();
+            if (!string.IsNullOrEmpty(cached) && File.Exists(cached) && IsVersionSufficient(cached, minMajorVersion))
+                return cached;
+
             try
             {
                 var bundled = GetBundledJavaFolder();
                 if (Directory.Exists(bundled))
                 {
-                    var javaExe = FindJavaInFolder(bundled);
-                    if (javaExe != null) return javaExe;
+                    var found = FindJavaInFolder(bundled, minMajorVersion);
+                    if (found != null) { CachePath(found); return found; }
                 }
             }
             catch { }
 
             try
             {
-                var javaHome = Environment.GetEnvironmentVariable("JAVA_HOME");
-                if (!string.IsNullOrEmpty(javaHome))
+                var home = Environment.GetEnvironmentVariable("JAVA_HOME");
+                if (!string.IsNullOrEmpty(home))
                 {
-                    var path = Path.Combine(javaHome, "bin", "java.exe");
-                    if (File.Exists(path)) return path;
+                    var path = Path.Combine(home, "bin", "java.exe");
+                    if (File.Exists(path) && IsVersionSufficient(path, minMajorVersion)) { CachePath(path); return path; }
                 }
             }
             catch { }
@@ -56,7 +167,7 @@ namespace MvpLauncher
                         try
                         {
                             var candidate = Path.Combine(dir.Trim(), "java.exe");
-                            if (File.Exists(candidate)) return candidate;
+                            if (File.Exists(candidate) && IsVersionSufficient(candidate, minMajorVersion)) { CachePath(candidate); return candidate; }
                         }
                         catch { }
                     }
@@ -71,22 +182,21 @@ namespace MvpLauncher
                 @"C:\Program Files\Microsoft\jdk",
                 @"C:\Program Files\Amazon Corretto",
                 @"C:\Program Files\Zulu",
+                @"C:\Program Files\BellSoft",
+                @"C:\Program Files\Semeru",
+                @"C:\Program Files\OpenJDK",
                 @"C:\Program Files (x86)\Java",
-                Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "Programs"),
-                Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                    "Java")
+                @"C:\Program Files\Common Files\Oracle\Java",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Java"),
             };
-
             foreach (var basePath in commonPaths)
             {
                 try
                 {
                     if (!Directory.Exists(basePath)) continue;
-                    var javaExe = FindJavaInFolder(basePath);
-                    if (javaExe != null) return javaExe;
+                    var found = FindJavaInFolder(basePath, minMajorVersion);
+                    if (found != null) { CachePath(found); return found; }
                 }
                 catch { }
             }
@@ -94,172 +204,201 @@ namespace MvpLauncher
             return null;
         }
 
-        private static string? FindJavaInFolder(string folder)
+        private static string? FindJavaInFolder(string folder, int minMajorVersion)
         {
             try
             {
                 foreach (var dir in Directory.GetDirectories(folder))
                 {
-                    var javaExe = Path.Combine(dir, "bin", "java.exe");
-                    if (File.Exists(javaExe)) return javaExe;
-
-                    var nested = FindJavaInFolder(dir);
+                    var exe = Path.Combine(dir, "bin", "java.exe");
+                    if (File.Exists(exe) && IsVersionSufficient(exe, minMajorVersion)) return exe;
+                    var nested = FindJavaInFolder(dir, minMajorVersion);
                     if (nested != null) return nested;
                 }
             }
             catch { }
+            return null;
+        }
+
+        public static Task<string?> EnsureJavaAsync()
+        {
+            lock (_installLock)
+            {
+                if (_installTask != null && !_installTask.IsCompleted)
+                    return _installTask;
+
+                var found = FindJava();
+                if (found != null)
+                {
+                    JavaReady?.Invoke(null, found);
+                    return Task.FromResult<string?>(found);
+                }
+
+                InstallStateChanged?.Invoke(null, true);
+                _installTask = Task.Run(async () =>
+                {
+                    try { return await DoInstallAsync(); }
+                    catch (Exception ex) { Debug.WriteLine($"[JavaManager] Install error: {ex}"); return null; }
+                    finally
+                    {
+                        InstallStateChanged?.Invoke(null, false);
+                        JavaReady?.Invoke(null, _cachedPath);
+                    }
+                });
+                return _installTask;
+            }
+        }
+
+        public static void StartBackgroundInstallIfNeeded()
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_cachedPath) && File.Exists(_cachedPath)) return;
+                var found = FindJava();
+                if (found != null) { _cachedPath = found; return; }
+
+                _ = Task.Run(async () => { try { await EnsureJavaAsync(); } catch { } });
+            }
+            catch { }
+        }
+
+        private static async Task<string?> DoInstallAsync()
+        {
+            var target = GetBundledJavaFolder();
+
+            foreach (var apiUrl in AdoptiumApis)
+            {
+                var r = await TryAdoptiumAsync(apiUrl, target);
+                if (r != null) { CachePath(r); return r; }
+            }
+
+            foreach (var url in DirectZipUrls)
+            {
+                var r = await TryDirectZipAsync(url, target);
+                if (r != null) { CachePath(r); return r; }
+            }
 
             return null;
         }
 
-        public static async Task<string?> DownloadAndInstallAsync(IProgress<int>? progress = null)
+        private static async Task<string?> TryAdoptiumAsync(string apiUrl, string target)
         {
             try
             {
-                var targetFolder = GetBundledJavaFolder();
-
-                if (Directory.Exists(targetFolder))
-                {
-                    try { Directory.Delete(targetFolder, true); } catch { }
-                }
-
-                Directory.CreateDirectory(targetFolder);
-
-                using var httpClient = new HttpClient
-                {
-                    Timeout = TimeSpan.FromMinutes(15)
-                };
-
-                var json = await httpClient.GetStringAsync(AdoptiumApiUrl);
+                using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+                var json = await http.GetStringAsync(apiUrl);
                 using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0) return null;
+                var link = doc.RootElement[0].GetProperty("binary").GetProperty("package").GetProperty("link").GetString();
+                if (string.IsNullOrEmpty(link)) return null;
+                return await DownloadAndExtractAsync(http, link, target);
+            }
+            catch (Exception ex) { Debug.WriteLine($"[JavaManager] Adoptium failed: {ex.Message}"); return null; }
+        }
 
-                if (doc.RootElement.GetArrayLength() == 0)
+        private static async Task<string?> TryDirectZipAsync(string url, string target)
+        {
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+                return await DownloadAndExtractAsync(http, url, target);
+            }
+            catch (Exception ex) { Debug.WriteLine($"[JavaManager] Direct failed: {ex.Message}"); return null; }
+        }
+
+        private static async Task<string?> DownloadAndExtractAsync(HttpClient http, string url, string target)
+        {
+            string? tempZip = null, extractTemp = null;
+            try
+            {
+                if (Directory.Exists(target)) { try { Directory.Delete(target, true); } catch { } }
+                Directory.CreateDirectory(target);
+
+                tempZip = Path.Combine(Path.GetTempPath(), $"mvp-jre-{Guid.NewGuid()}.zip");
+
+                using (var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
                 {
-                    throw new Exception("Nem található Java letöltési link.");
-                }
-
-                var first = doc.RootElement[0];
-                var binaryLink = first
-                    .GetProperty("binary")
-                    .GetProperty("package")
-                    .GetProperty("link")
-                    .GetString();
-
-                if (string.IsNullOrEmpty(binaryLink))
-                {
-                    throw new Exception("Érvénytelen letöltési link.");
-                }
-
-                var tempZip = Path.Combine(Path.GetTempPath(), "mvplauncher-jre.zip");
-
-                using (var response = await httpClient.GetAsync(binaryLink, HttpCompletionOption.ResponseHeadersRead))
-                {
-                    response.EnsureSuccessStatusCode();
-
-                    var total = response.Content.Headers.ContentLength ?? 0;
-
-                    using var stream = await response.Content.ReadAsStreamAsync();
-                    using var fileStream = File.Create(tempZip);
+                    resp.EnsureSuccessStatusCode();
+                    var total = resp.Content.Headers.ContentLength ?? 0;
+                    using var stream = await resp.Content.ReadAsStreamAsync();
+                    using var fs = File.Create(tempZip);
 
                     var buffer = new byte[81920];
                     long read = 0;
                     int bytes;
-
                     while ((bytes = await stream.ReadAsync(buffer)) > 0)
                     {
-                        await fileStream.WriteAsync(buffer.AsMemory(0, bytes));
+                        await fs.WriteAsync(buffer.AsMemory(0, bytes));
                         read += bytes;
-
-                        if (total > 0)
-                        {
-                            progress?.Report((int)(read * 100 / total));
-                        }
+                        if (total > 0) InstallProgress?.Invoke(null, (int)(read * 100 / total));
                     }
                 }
+                InstallProgress?.Invoke(null, 100);
 
-                progress?.Report(100);
-
-                var extractTemp = Path.Combine(Path.GetTempPath(), "mvplauncher-jre-extract");
-                if (Directory.Exists(extractTemp))
-                {
-                    try { Directory.Delete(extractTemp, true); } catch { }
-                }
-
+                extractTemp = Path.Combine(Path.GetTempPath(), $"mvp-jre-x-{Guid.NewGuid()}");
                 Directory.CreateDirectory(extractTemp);
-
                 ZipFile.ExtractToDirectory(tempZip, extractTemp);
 
-                var subDirs = Directory.GetDirectories(extractTemp);
-                if (subDirs.Length > 0)
+                string source = extractTemp;
+                if (!File.Exists(Path.Combine(source, "bin", "java.exe")))
                 {
-                    var inner = subDirs[0];
-                    foreach (var item in Directory.GetFileSystemEntries(inner))
+                    foreach (var sub in Directory.GetDirectories(extractTemp))
                     {
-                        var destName = Path.GetFileName(item);
-                        var destPath = Path.Combine(targetFolder, destName);
-
-                        if (Directory.Exists(item))
-                        {
-                            CopyDirectory(item, destPath);
-                        }
-                        else
-                        {
-                            File.Copy(item, destPath, true);
-                        }
-                    }
-                }
-                else
-                {
-                    foreach (var item in Directory.GetFileSystemEntries(extractTemp))
-                    {
-                        var destName = Path.GetFileName(item);
-                        var destPath = Path.Combine(targetFolder, destName);
-
-                        if (Directory.Exists(item))
-                        {
-                            CopyDirectory(item, destPath);
-                        }
-                        else
-                        {
-                            File.Copy(item, destPath, true);
-                        }
+                        if (File.Exists(Path.Combine(sub, "bin", "java.exe"))) { source = sub; break; }
                     }
                 }
 
-                try { File.Delete(tempZip); } catch { }
-                try { Directory.Delete(extractTemp, true); } catch { }
-
-                var javaExe = Path.Combine(targetFolder, "bin", "java.exe");
-
-                if (File.Exists(javaExe))
+                foreach (var item in Directory.GetFileSystemEntries(source))
                 {
+                    var dest = Path.Combine(target, Path.GetFileName(item));
+                    if (Directory.Exists(item)) CopyDirectory(item, dest);
+                    else File.Copy(item, dest, true);
+                }
+
+                var javaExe = Path.Combine(target, "bin", "java.exe");
+                if (!File.Exists(javaExe))
+                {
+                    var found = FindJavaInFolder(target, RequiredMajorVersion);
+                    if (found != null) javaExe = found;
+                }
+
+                if (File.Exists(javaExe) && IsVersionSufficient(javaExe, RequiredMajorVersion))
+                {
+                    AddToUserPath(Path.GetDirectoryName(javaExe)!);
                     return javaExe;
                 }
-
-                return FindJavaInFolder(targetFolder);
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[JavaManager] HIBA: {ex.Message}");
                 return null;
             }
+            catch (Exception ex) { Debug.WriteLine($"[JavaManager] Download/extract failed: {ex.Message}"); return null; }
+            finally
+            {
+                if (tempZip != null) try { File.Delete(tempZip); } catch { }
+                if (extractTemp != null) try { Directory.Delete(extractTemp, true); } catch { }
+            }
+        }
+
+        private static void AddToUserPath(string binPath)
+        {
+            try
+            {
+                var current = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
+                var parts = current.Split(';', StringSplitOptions.RemoveEmptyEntries).Select(p => p.Trim()).ToList();
+                if (!parts.Any(p => string.Equals(p, binPath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    parts.Add(binPath);
+                    Environment.SetEnvironmentVariable("PATH", string.Join(";", parts), EnvironmentVariableTarget.User);
+                }
+            }
+            catch { }
         }
 
         private static void CopyDirectory(string source, string dest)
         {
             Directory.CreateDirectory(dest);
-
             foreach (var file in Directory.GetFiles(source))
-            {
-                var target = Path.Combine(dest, Path.GetFileName(file));
-                File.Copy(file, target, true);
-            }
-
+                File.Copy(file, Path.Combine(dest, Path.GetFileName(file)), true);
             foreach (var dir in Directory.GetDirectories(source))
-            {
-                var target = Path.Combine(dest, Path.GetFileName(dir));
-                CopyDirectory(dir, target);
-            }
+                CopyDirectory(dir, Path.Combine(dest, Path.GetFileName(dir)));
         }
     }
 }

@@ -1,5 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using System.Collections.ObjectModel;
 using System.IO;
 using System.Text.Json;
 
@@ -22,6 +21,8 @@ namespace MvpLauncher
         public string Language { get; set; } = "hu";
         public string JavaPreset { get; set; } = "Default";
         public string JavaArgs { get; set; } = "";
+        public ObservableCollection<InstanceProfile> InstanceProfiles { get; set; } = new();
+        public string SelectedInstanceProfile { get; set; } = "";
         public List<string> MultiLaunchAccounts { get; set; } = new();
 
         public static string SettingsPath =>
@@ -47,6 +48,7 @@ namespace MvpLauncher
                         }
                         if (string.IsNullOrEmpty(s.Language)) s.Language = "hu";
                         if (string.IsNullOrEmpty(s.JavaPreset)) s.JavaPreset = "Default";
+                        if (s.InstanceProfiles == null) s.InstanceProfiles = new ObservableCollection<InstanceProfile>();
                         if (s.MultiLaunchAccounts == null) s.MultiLaunchAccounts = new List<string>();
                         return s;
                     }
@@ -64,6 +66,8 @@ namespace MvpLauncher
                 Language = "hu",
                 JavaPreset = "Default",
                 JavaArgs = "",
+                InstanceProfiles = new ObservableCollection<InstanceProfile>(),
+                SelectedInstanceProfile = "",
                 MultiLaunchAccounts = new List<string>()
             };
         }
