@@ -13,7 +13,6 @@ namespace MvpLauncher
         private bool _userCancelled;
         private bool _closingAnimationStarted;
 
-        // A körív geometriája (160x160 Grid → középpont 80, sugár 60)
         private const double CircleRadius = 60;
         private const double CircleCenter = 80;
 
@@ -35,7 +34,6 @@ namespace MvpLauncher
             if (d is LoadingWindow w)
             {
                 w.UpdateCircularProgress((double)e.NewValue);
-                w.UpdateBottomBar((double)e.NewValue);
             }
         }
 
@@ -59,7 +57,6 @@ namespace MvpLauncher
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
-            // Fade-in
             BeginAnimation(OpacityProperty, new DoubleAnimation
             {
                 From = 0,
@@ -68,7 +65,6 @@ namespace MvpLauncher
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
             });
 
-            // Lágy pulzálás a külső izzáson
             if (glowRing != null)
             {
                 var pulse = new DoubleAnimation
@@ -84,7 +80,6 @@ namespace MvpLauncher
             }
 
             UpdateCircularProgress(0);
-            UpdateBottomBar(0);
         }
 
         private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -95,10 +90,6 @@ namespace MvpLauncher
             Application.Current?.Shutdown(0);
         }
 
-        /// <summary>
-        /// Elegáns fade-out, majd bezárás. A hívó előbb már megjelenítheti a MainWindow-t,
-        /// így az átmenet zökkenőmentes lesz.
-        /// </summary>
         public async Task FadeOutAndCloseAsync()
         {
             _closingAnimationStarted = true;
@@ -113,7 +104,7 @@ namespace MvpLauncher
             fade.Completed += (s, e) => tcs.TrySetResult();
 
             BeginAnimation(OpacityProperty, fade);
-            await Task.WhenAny(tcs.Task, Task.Delay(600));
+            await Task.WhenAny(tcs.Task, Task.Delay(300));
 
             _startupComplete = true;
             Close();
@@ -156,26 +147,6 @@ namespace MvpLauncher
             pathProgress.Data = geometry;
         }
 
-        private void UpdateBottomBar(double pct)
-        {
-            if (lblPercent != null)
-                lblPercent.Text = $"{(int)pct}%";
-
-            if (progressBar != null)
-                progressBar.Value = pct;
-
-            if (progressFill == null || progressTrack == null) return;
-
-            double targetWidth = progressTrack.ActualWidth * (pct / 100.0);
-
-            progressFill.BeginAnimation(FrameworkElement.WidthProperty, new DoubleAnimation
-            {
-                To = targetWidth,
-                Duration = TimeSpan.FromMilliseconds(350),
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
-            });
-        }
-
         private void SetStatus(string status, double progress)
         {
             try
@@ -195,7 +166,6 @@ namespace MvpLauncher
         {
             if (lblStatus != null) lblStatus.Text = status;
 
-            // Sima, animált progress-frissítés
             BeginAnimation(ProgressProperty, new DoubleAnimation
             {
                 From = Progress,
@@ -243,18 +213,18 @@ namespace MvpLauncher
         {
             try
             {
-                await Task.Delay(400);
+                await Task.Delay(150);
                 if (_userCancelled) return;
 
                 SetStatus("Beállítások betöltése...", 10);
                 SetDetail("Konfigurációk olvasása...");
-                await Task.Delay(200);
+                await Task.Yield();
                 if (_userCancelled) return;
 
                 SetStatus("Java ellenőrzése...", 30);
                 try
                 {
-                    var javaPath = JavaManager.FindJava();
+                    var javaPath = await JavaManager.FindJavaAsync();
                     SetDetail(javaPath != null
                         ? "Java megtalálva"
                         : "Java nem található – automatikus telepítés szükséges lehet");
@@ -264,7 +234,7 @@ namespace MvpLauncher
                     Debug.WriteLine($"[Loading] Java keresési hiba: {ex.Message}");
                     SetDetail("Java ellenőrzés sikertelen");
                 }
-                await Task.Delay(300);
+                await Task.Yield();
                 if (_userCancelled) return;
 
                 SetStatus("Modok szinkronizálása...", 60);
@@ -288,12 +258,11 @@ namespace MvpLauncher
 
                 SetStatus("Előkészítés...", 90);
                 SetDetail("Felhasználói felület betöltése...");
-                await Task.Delay(400);
+                await Task.Delay(120);
                 if (_userCancelled) return;
 
                 SetStatus("Készen áll", 100);
                 SetDetail("");
-                await Task.Delay(300);
             }
             catch (Exception ex)
             {

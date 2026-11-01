@@ -172,35 +172,6 @@
                 </StackPanel>
 
                 <StackPanel Grid.Row="1" Margin="28,0,28,24">
-                    <Grid Margin="0,0,0,6">
-                        <TextBlock Text="Betöltés"
-                                   Foreground="#52525B"
-                                   FontSize="10"
-                                   FontWeight="SemiBold"
-                                   HorizontalAlignment="Left"/>
-                        <TextBlock x:Name="lblPercent"
-                                   Text="0%"
-                                   Foreground="#71717A"
-                                   FontSize="10"
-                                   FontWeight="SemiBold"
-                                   HorizontalAlignment="Right"/>
-                    </Grid>
-
-                    <Grid Height="4">
-                        <Border x:Name="progressTrack"
-                                Background="#1A1A24"
-                                CornerRadius="2"/>
-                        <Border x:Name="progressFill"
-                                Background="#3B82F6"
-                                CornerRadius="2"
-                                HorizontalAlignment="Left"
-                                Width="0">
-                            <Border.Effect>
-                                <DropShadowEffect Color="#3B82F6" BlurRadius="6"
-                                                  ShadowDepth="0" Opacity="0.7"/>
-                            </Border.Effect>
-                        </Border>
-                    </Grid>
 
                     <ProgressBar x:Name="progressBar"
                                  Visibility="Collapsed"

@@ -204,6 +204,15 @@ namespace MvpLauncher
             return null;
         }
 
+        public static Task<string?> FindJavaAsync(int minMajorVersion = RequiredMajorVersion)
+        {
+            var cached = _cachedPath ?? TryReadCachedPath();
+            if (!string.IsNullOrEmpty(cached) && File.Exists(cached) && IsVersionSufficient(cached, minMajorVersion))
+                return Task.FromResult<string?>(cached);
+
+            return Task.Run(() => FindJava(minMajorVersion));
+        }
+
         private static string? FindJavaInFolder(string folder, int minMajorVersion)
         {
             try
@@ -285,7 +294,7 @@ namespace MvpLauncher
         {
             try
             {
-                using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+                var http = MvpLauncher.Infrastructure.HttpClients.Shared;
                 var json = await http.GetStringAsync(apiUrl);
                 using var doc = JsonDocument.Parse(json);
                 if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0) return null;
@@ -300,8 +309,7 @@ namespace MvpLauncher
         {
             try
             {
-                using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-                return await DownloadAndExtractAsync(http, url, target);
+                return await DownloadAndExtractAsync(MvpLauncher.Infrastructure.HttpClients.Shared, url, target);
             }
             catch (Exception ex) { Debug.WriteLine($"[JavaManager] Direct failed: {ex.Message}"); return null; }
         }

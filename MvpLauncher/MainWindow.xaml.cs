@@ -3,12 +3,14 @@ using CmlLib.Core.Auth;
 using CmlLib.Core.Auth.Microsoft;
 using CmlLib.Core.ModLoaders.FabricMC;
 using CmlLib.Core.ProcessBuilder;
+using MvpLauncher.Infrastructure;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
 using System.Reflection;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -27,6 +29,10 @@ namespace MvpLauncher
         private const int MaxMultiLaunchClients = 10;
         private const string SingleInstanceName = "Single Launch";
         private const string MultiInstanceName = "Multi Launch";
+        private const int MaxLevenshteinDistance = 2;
+        private const string SupportedGameVersion = "1.19.4";
+        private const string SupportedLoader = "fabric";
+        private static readonly TimeSpan FailedDependencyRetryDelay = TimeSpan.FromMinutes(5);
 
         public static readonly string AppVersion =
             Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "1.0.0";
@@ -48,13 +54,29 @@ namespace MvpLauncher
         private bool _isClosed;
         private bool _viewTransitioning;
         private bool _marcsiMode;
+        private bool _isProcessingDeps;
         private JELoginHandler? _loginHandler;
         private System.Windows.Threading.DispatcherTimer? _updateTimer;
         private System.Windows.Threading.DispatcherTimer? _searchDebounceTimer;
+        private System.Windows.Threading.DispatcherTimer? _saveDebounceTimer;
         private string? _javaPath;
         private UpdateManager? _velopack;
         private string? _cachedFabricVersionName;
         private string? _cachedAssetsVersionName;
+        private ModMetadataCache _metadataCache = new();
+        private readonly SemaphoreSlim _modLoadLock = new(1, 1);
+        private static readonly HttpClient _staticHttp = HttpClients.Shared;
+
+        private readonly Dictionary<string, string> _resolvedDepCache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private readonly Dictionary<string, ModrinthProject> _projectResolutionCache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private readonly Dictionary<string, DateTime> _failedDependencyAttempts =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private bool _dependencyProcessingQueued;
 
         public ICollectionView FilteredMods { get; }
 
@@ -205,9 +227,7 @@ namespace MvpLauncher
                 {
                     var value = prop.GetValue(obj);
                     if (value is string s && !string.IsNullOrEmpty(s))
-                    {
                         return s;
-                    }
                 }
             }
             catch { }
@@ -234,7 +254,6 @@ namespace MvpLauncher
                         if (parameters.Length != 1) continue;
 
                         var paramType = parameters[0].ParameterType;
-
                         if (!paramType.IsInstanceOfType(account)) continue;
 
                         method.Invoke(accountManager, new[] { account });
@@ -258,6 +277,7 @@ namespace MvpLauncher
         public MainWindow()
         {
             _settings = AppSettings.Load();
+            LoadDepAliasCache();
 
             InitializeComponent();
 
@@ -300,14 +320,21 @@ namespace MvpLauncher
                 _loginHandler = null;
             }
 
-            _javaPath = JavaManager.FindJava();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var path = await JavaManager.FindJavaAsync();
+                    if (!string.IsNullOrEmpty(path))
+                        await Dispatcher.InvokeAsync(() => _javaPath = path);
+                }
+                catch { }
+            });
 
             JavaManager.JavaReady += (s, path) =>
             {
                 if (!string.IsNullOrEmpty(path))
-                {
                     _ = Dispatcher.InvokeAsync(() => _javaPath = path);
-                }
             };
 
             JavaManager.InstallProgress += (s, pct) =>
@@ -345,10 +372,10 @@ namespace MvpLauncher
             long totalRamMb = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024L * 1024L);
             sldRam.Maximum = Math.Max(totalRamMb, 2048);
 
-            LoadMods();
             LoadProfiles();
             LoadSettingsIntoUI();
-            EnsureDefaultInstances();
+            InitializeInstanceSelector();
+            _ = LoadModsAsync();
 
             Loaded += async (s, e) =>
             {
@@ -360,18 +387,14 @@ namespace MvpLauncher
                     if (lblHeaderVersion != null)
                         lblHeaderVersion.Text = $"v{AppVersion}";
                     if (lblAboutVersion != null)
-                    {
                         lblAboutVersion.Text = $"Verzió: {AppVersion}";
-                    }
 
                     JavaManager.StartBackgroundInstallIfNeeded();
 
-                    LoadSettingsIntoUI();
                     UpdateSkin();
                     RestoreMultiLaunchFromSettings();
 
                     _ = CheckForUpdatesAsync(showPopup: false);
-
                     StartUpdateTimer();
 
                     await Task.CompletedTask;
@@ -404,8 +427,11 @@ namespace MvpLauncher
                 {
                     SaveCurrentSettings();
                     SaveMultiLaunchToSettings();
+                    FlushPendingSave();
+                    _metadataCache.SaveIfDirty();
                     _updateTimer?.Stop();
                     _searchDebounceTimer?.Stop();
+                    _saveDebounceTimer?.Stop();
                 }
                 catch (Exception ex)
                 {
@@ -426,6 +452,31 @@ namespace MvpLauncher
                     EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
                 });
             }
+        }
+
+        private void ScheduleSave()
+        {
+            if (_isClosed) { _settings.Save(); return; }
+
+            _saveDebounceTimer?.Stop();
+            _saveDebounceTimer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(400)
+            };
+            _saveDebounceTimer.Tick += (s, e) =>
+            {
+                _saveDebounceTimer?.Stop();
+                _saveDebounceTimer = null;
+                try { _settings.Save(); } catch { }
+            };
+            _saveDebounceTimer.Start();
+        }
+
+        private void FlushPendingSave()
+        {
+            _saveDebounceTimer?.Stop();
+            _saveDebounceTimer = null;
+            _settings.Save();
         }
 
         private void SetProgress(double pct, bool smooth = true)
@@ -518,9 +569,7 @@ namespace MvpLauncher
         {
             var cacheItem = AllMods.FirstOrDefault(m => m.IsFromCache);
             if (cacheItem != null && !string.IsNullOrEmpty(_cacheManager.CurrentVersion))
-            {
                 cacheItem.Version = _cacheManager.CurrentVersion;
-            }
         }
 
         private bool FilterMods(object obj)
@@ -584,16 +633,13 @@ namespace MvpLauncher
             }
             catch { }
 
-            var fabricInstaller = new FabricInstaller(new HttpClient());
+            var fabricInstaller = new FabricInstaller(HttpClients.Shared);
             var versionName = await fabricInstaller.Install("1.19.4", _minecraftPath);
 
             try
             {
                 string? dir = Path.GetDirectoryName(markerPath);
-                if (!string.IsNullOrEmpty(dir))
-                {
-                    Directory.CreateDirectory(dir);
-                }
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                 File.WriteAllText(markerPath, versionName);
             }
             catch { }
@@ -634,13 +680,28 @@ namespace MvpLauncher
             try
             {
                 string? dir = Path.GetDirectoryName(markerPath);
-                if (!string.IsNullOrEmpty(dir))
-                {
-                    Directory.CreateDirectory(dir);
-                }
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
                 File.WriteAllText(markerPath, versionName);
             }
             catch { }
+        }
+
+        private void InitializeInstanceSelector()
+        {
+            // The real profile setup happens after the mods are loaded, because
+            // EnsureDefaultInstances() seeds new profiles from the enabled mods.
+            _isLoadingInstanceSelector = true;
+            cmbInstanceSelector.SelectedIndex =
+                _settings.SelectedInstanceProfile == MultiInstanceName ? 1 : 0;
+            _isLoadingInstanceSelector = false;
+
+            if (lblCurrentInstance != null)
+            {
+                lblCurrentInstance.Text =
+                    _settings.SelectedInstanceProfile == MultiInstanceName
+                        ? "Multi Launch"
+                        : "Single Launch";
+            }
         }
 
         private void EnsureDefaultInstances()
@@ -649,9 +710,7 @@ namespace MvpLauncher
                 .Where(p => p.Name != SingleInstanceName && p.Name != MultiInstanceName)
                 .ToList();
             foreach (var p in toRemove)
-            {
                 _settings.InstanceProfiles.Remove(p);
-            }
 
             var currentEnabled = AllMods
                 .Where(m => m.IsEnabled && !m.IsMandatory && !m.IsFromCache)
@@ -751,6 +810,7 @@ namespace MvpLauncher
             if (profile != null)
             {
                 ApplyInstanceProfile(profile);
+                QueueDependencyProcessing();
             }
         }
 
@@ -779,15 +839,22 @@ namespace MvpLauncher
 
                 UpdateLocks();
 
+                var resolver = new ModDependencyResolver(AllMods);
+
                 foreach (var mod in AllMods)
                 {
                     if (mod.IsMandatory || mod.IsFromCache) continue;
                     if (!enabledSet.Contains(mod.DisplayName)) continue;
-                    if (mod.IsEnabled) continue;
 
-                    mod.IsLocked = false;
-                    mod.IsEnabled = true;
-                    EnableDependenciesRecursive(mod, new HashSet<ModItem>());
+                    if (!mod.IsEnabled)
+                    {
+                        mod.IsLocked = false;
+                        mod.IsEnabled = true;
+                    }
+
+                    // Even an already enabled mod can have disabled or missing
+                    // transitive dependencies, so always walk the chain.
+                    resolver.EnableRequiredDependencies(mod, new HashSet<ModItem>());
                 }
 
                 UpdateLocks();
@@ -798,11 +865,21 @@ namespace MvpLauncher
                 _isUpdatingMods = false;
                 _applyingInstance = false;
             }
+
+            // Store the dependencies that were enabled automatically as part of
+            // this instance profile, so switching instances keeps both profiles
+            // self-consistent.
+            SyncCurrentInstanceFromMods();
         }
 
         private void SyncCurrentInstanceFromMods()
         {
             if (_applyingInstance) return;
+
+            // Before LoadModsAsync finishes there is no reliable state to save.
+            // Without this guard the constructor's preliminary profile apply
+            // would overwrite the stored profile with an empty mod list.
+            if (AllMods.Count == 0) return;
 
             var profile = _settings.InstanceProfiles
                 .FirstOrDefault(p => p.Name == _settings.SelectedInstanceProfile);
@@ -813,7 +890,7 @@ namespace MvpLauncher
                 .Select(m => m.DisplayName)
                 .ToList();
 
-            _settings.Save();
+            ScheduleSave();
         }
 
         private void AddModsToCurrentInstance(IEnumerable<string> modNames)
@@ -833,7 +910,7 @@ namespace MvpLauncher
                 }
             }
 
-            _settings.Save();
+            ScheduleSave();
         }
 
         private void EnsureModsFolderExists()
@@ -841,9 +918,7 @@ namespace MvpLauncher
             try
             {
                 if (!Directory.Exists(_modsFolder))
-                {
                     Directory.CreateDirectory(_modsFolder);
-                }
             }
             catch { }
         }
@@ -865,9 +940,7 @@ namespace MvpLauncher
                     string destDisabled = destEnabled + ".disabled";
 
                     if (File.Exists(destEnabled) || File.Exists(destDisabled))
-                    {
                         continue;
-                    }
 
                     File.Copy(bundledFile, destEnabled, true);
                 }
@@ -875,53 +948,76 @@ namespace MvpLauncher
             catch { }
         }
 
-        private void LoadMods()
+        private async Task LoadModsAsync()
         {
-            foreach (var mod in AllMods)
+            await _modLoadLock.WaitAsync();
+            try
             {
-                mod.PropertyChanged -= OnModPropertyChanged;
-            }
+                foreach (var mod in AllMods)
+                    mod.PropertyChanged -= OnModPropertyChanged;
 
-            AllMods.Clear();
+                AllMods.Clear();
 
-            if (Directory.Exists(_modsFolder))
-            {
-                foreach (var path in Directory.GetFiles(_modsFolder, "*.jar"))
+                var fileList = new List<(string path, bool enabled)>();
+                if (Directory.Exists(_modsFolder))
                 {
-                    AddModItem(path, true);
+                    foreach (var path in Directory.GetFiles(_modsFolder, "*.jar"))
+                        fileList.Add((path, true));
+                    foreach (var path in Directory.GetFiles(_modsFolder, "*.jar.disabled"))
+                        fileList.Add((path, false));
                 }
 
-                foreach (var path in Directory.GetFiles(_modsFolder, "*.jar.disabled"))
+                var items = await Task.Run(() =>
                 {
-                    AddModItem(path, false);
-                }
-            }
+                    var result = new List<ModItem>(fileList.Count);
+                    foreach (var (path, enabled) in fileList)
+                    {
+                        try
+                        {
+                            var item = CreateModItemFromFile(path, enabled);
+                            if (item != null) result.Add(item);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[LoadMods] {ex.Message}");
+                        }
+                    }
+                    return result;
+                });
 
-            var cacheItem = _cacheManager.GetCacheModItem();
-            if (cacheItem != null)
+                foreach (var item in items)
+                    AllMods.Add(item);
+
+                var cacheItem = _cacheManager.GetCacheModItem();
+                if (cacheItem != null) AllMods.Add(cacheItem);
+
+                foreach (var mod in AllMods)
+                    mod.PropertyChanged += OnModPropertyChanged;
+
+                _metadataCache.PruneMissing(items.Select(i => i.DisplayName));
+                _metadataCache.SaveIfDirty();
+
+                BuildDependencyGraph();
+                RefreshModCategories();
+
+                // Profiles are created/updated only after the mod state is known,
+                // otherwise a fresh install would persist empty profiles and
+                // disable every installed mod on the first load.
+                EnsureDefaultInstances();
+
+                FilteredMods?.Refresh();
+
+                // Detect and install dependencies of the mods enabled in the
+                // current instance profile. This runs in the background.
+                QueueDependencyProcessing();
+            }
+            finally
             {
-                AllMods.Add(cacheItem);
+                _modLoadLock.Release();
             }
-
-            foreach (var mod in AllMods)
-            {
-                mod.PropertyChanged += OnModPropertyChanged;
-            }
-
-            BuildDependencyGraph();
-            RefreshModCategories();
-
-            var profile = _settings.InstanceProfiles
-                .FirstOrDefault(p => p.Name == _settings.SelectedInstanceProfile);
-            if (profile != null)
-            {
-                ApplyInstanceProfile(profile);
-            }
-
-            FilteredMods?.Refresh();
         }
 
-        private void AddModItem(string path, bool enabled)
+        private ModItem? CreateModItemFromFile(string path, bool enabled)
         {
             string fileName = Path.GetFileName(path);
             string actualBase = enabled
@@ -938,8 +1034,9 @@ namespace MvpLauncher
                 IsEnabled = enabled
             };
 
-            bool isMandatory = actualBase.StartsWith("fabric-api-", StringComparison.OrdinalIgnoreCase) ||
-                               actualBase.StartsWith("satin-", StringComparison.OrdinalIgnoreCase);
+            bool isMandatory =
+                actualBase.StartsWith("fabric-api-", StringComparison.OrdinalIgnoreCase) ||
+                actualBase.StartsWith("satin-", StringComparison.OrdinalIgnoreCase);
 
             if (isMandatory)
             {
@@ -961,64 +1058,87 @@ namespace MvpLauncher
                 }
             }
 
-            var info = FabricMetadataReader.Read(File.Exists(fullPath) ? fullPath : path);
+            var targetPath = File.Exists(fullPath) ? fullPath : path;
+            var fi = new FileInfo(targetPath);
+
+            FabricModInfo? info = null;
+            if (!_metadataCache.TryGet(actualBase, fi, out var cachedInfo))
+            {
+                info = FabricMetadataReader.Read(targetPath);
+                if (info != null) _metadataCache.Set(actualBase, fi, info);
+            }
+            else
+            {
+                info = cachedInfo;
+            }
+
             if (info != null)
             {
                 modItem.ModId = info.Id;
                 modItem.Version = info.Version;
                 modItem.Author = info.Author;
                 modItem.Description = info.Description;
+
                 foreach (var dep in info.Depends)
-                {
                     modItem.Dependencies.Add(dep);
-                }
-            }
 
-            AllMods.Add(modItem);
-        }
+                foreach (var prov in info.Provides)
+                    modItem.Provides.Add(prov);
 
-        private void BuildDependencyGraph()
-        {
-            var byId = GetAllModsById();
-
-            foreach (var mod in AllMods)
-            {
-                mod.Dependents.Clear();
-            }
-
-            foreach (var mod in AllMods)
-            {
-                foreach (var depId in mod.Dependencies)
+                if (!modItem.IsMandatory && IsMandatoryMod(info.Id))
                 {
-                    if (byId.TryGetValue(depId, out var depMod))
+                    modItem.IsMandatory = true;
+                    modItem.IsLocked = true;
+
+                    if (!enabled)
                     {
-                        if (!depMod.Dependents.Contains(mod.DisplayName))
+                        try
                         {
-                            depMod.Dependents.Add(mod.DisplayName);
+                            string disabledPath = fullPath + ".disabled";
+                            if (File.Exists(disabledPath))
+                            {
+                                File.Move(disabledPath, fullPath, overwrite: true);
+                                modItem.IsEnabled = true;
+                            }
                         }
+                        catch { }
                     }
                 }
             }
 
-            foreach (var mod in AllMods)
-            {
-                mod.RefreshDependencyText();
-            }
+            return modItem;
+        }
 
+        private static bool IsMandatoryMod(string modId)
+        {
+            var normalized = ModDependencyResolver.Normalize(modId);
+            return normalized == "fabric-api" || normalized == "satin";
+        }
+
+        private void BuildDependencyGraph()
+        {
+            var resolver = new ModDependencyResolver(AllMods);
+            resolver.BuildGraph();
+
+            UpdateDependencyStatus(resolver);
             UpdateLocks();
         }
 
-        private Dictionary<string, ModItem> GetAllModsById()
+        private void UpdateDependencyStatus(ModDependencyResolver resolver)
         {
-            var byId = new Dictionary<string, ModItem>();
-            foreach (var mod in AllMods)
+            var missing = resolver.GetMissingDependencies();
+            if (missing.Count == 0) return;
+
+            Debug.WriteLine("[Dep] Hiányzó függőségek: " + string.Join(", ", missing));
+
+            if (lblStatus != null)
             {
-                if (!string.IsNullOrEmpty(mod.ModId))
-                {
-                    byId[mod.ModId] = mod;
-                }
+                var list = string.Join(", ", missing.Take(6));
+                if (missing.Count > 6)
+                    list += $" (+{missing.Count - 6})";
+
+                lblStatus.Text = $"Hiányzó függőség: {list}";
             }
-            return byId;
         }
 
         private void UpdateLocks()
@@ -1032,6 +1152,13 @@ namespace MvpLauncher
                 }
                 FilteredMods?.Refresh();
                 return;
+            }
+
+            var byName = new Dictionary<string, ModItem>(StringComparer.OrdinalIgnoreCase);
+            foreach (var mod in AllMods)
+            {
+                if (!string.IsNullOrEmpty(mod.DisplayName))
+                    byName[mod.DisplayName] = mod;
             }
 
             foreach (var mod in AllMods)
@@ -1053,11 +1180,8 @@ namespace MvpLauncher
                 var enabledDependents = new List<string>();
                 foreach (var dependentName in mod.Dependents)
                 {
-                    var dependent = AllMods.FirstOrDefault(m => m.DisplayName == dependentName);
-                    if (dependent != null && dependent.IsEnabled)
-                    {
+                    if (byName.TryGetValue(dependentName, out var dependent) && dependent.IsEnabled)
                         enabledDependents.Add(dependent.DisplayName);
-                    }
                 }
 
                 if (enabledDependents.Count > 0)
@@ -1102,9 +1226,7 @@ namespace MvpLauncher
             for (int i = target.Count - 1; i >= 0; i--)
             {
                 if (!desired.Contains(target[i]))
-                {
                     target.RemoveAt(i);
-                }
             }
 
             for (int i = 0; i < desired.Count; i++)
@@ -1114,13 +1236,9 @@ namespace MvpLauncher
 
                 int existing = target.IndexOf(desired[i]);
                 if (existing >= 0)
-                {
                     target.Move(existing, i);
-                }
                 else
-                {
                     target.Insert(i, desired[i]);
-                }
             }
         }
 
@@ -1135,6 +1253,7 @@ namespace MvpLauncher
                 if (sender is ModItem mod && mod.IsEnabled)
                 {
                     EnableDependenciesRecursive(mod, new HashSet<ModItem>());
+                    QueueDependencyProcessing();
                 }
 
                 UpdateLocks();
@@ -1187,16 +1306,400 @@ namespace MvpLauncher
 
         private void EnableDependenciesRecursive(ModItem mod, HashSet<ModItem> visited)
         {
-            if (!visited.Add(mod)) return;
+            var resolver = new ModDependencyResolver(AllMods);
+            resolver.EnableRequiredDependencies(mod, visited);
+        }
 
-            var byId = GetAllModsById();
-            foreach (var depId in mod.Dependencies)
+        private string GetDepAliasCachePath() =>
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                ".mvplauncher",
+                "dep-aliases.json");
+
+        private void LoadDepAliasCache()
+        {
+            try
             {
-                if (byId.TryGetValue(depId, out var depMod) && !depMod.IsEnabled)
+                var path = GetDepAliasCachePath();
+                if (!File.Exists(path)) return;
+
+                var json = File.ReadAllText(path);
+                var d = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+                if (d == null) return;
+
+                foreach (var kv in d)
                 {
-                    depMod.IsEnabled = true;
-                    EnableDependenciesRecursive(depMod, visited);
+                    if (!string.IsNullOrEmpty(kv.Key) && !string.IsNullOrEmpty(kv.Value))
+                        _resolvedDepCache[kv.Key] = kv.Value;
                 }
+            }
+            catch { }
+        }
+
+        private void SaveDepAliasCache()
+        {
+            try
+            {
+                var path = GetDepAliasCachePath();
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+                File.WriteAllText(path, JsonSerializer.Serialize(
+                    _resolvedDepCache,
+                    new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch { }
+        }
+
+        private static int LevenshteinDistance(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a)) return b?.Length ?? 0;
+            if (string.IsNullOrEmpty(b)) return a.Length;
+
+            int[,] d = new int[a.Length + 1, b.Length + 1];
+            for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+            for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+
+            for (int i = 1; i <= a.Length; i++)
+            {
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    d[i, j] = Math.Min(
+                        Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
+                        d[i - 1, j - 1] + cost);
+                }
+            }
+            return d[a.Length, b.Length];
+        }
+
+        private void QueueDependencyProcessing()
+        {
+            if (_isProcessingDeps)
+            {
+                _dependencyProcessingQueued = true;
+                return;
+            }
+
+            _ = RunDependencyProcessingAsync();
+        }
+
+        private async Task RunDependencyProcessingAsync()
+        {
+            if (_isProcessingDeps)
+            {
+                _dependencyProcessingQueued = true;
+                return;
+            }
+
+            _isProcessingDeps = true;
+            try
+            {
+                do
+                {
+                    _dependencyProcessingQueued = false;
+                    await ProcessDependenciesAsync();
+                }
+                while (_dependencyProcessingQueued);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Dep] Feldolgozási hiba: {ex.Message}");
+            }
+            finally
+            {
+                _isProcessingDeps = false;
+            }
+        }
+
+        private async Task ProcessDependenciesAsync()
+        {
+            const int maxIterations = 6;
+
+            var downloadedCount = 0;
+            var unresolved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var attempted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (int iteration = 0; iteration < maxIterations; iteration++)
+            {
+                var resolver = new ModDependencyResolver(AllMods);
+                var missing = resolver.GetMissingDependencies();
+
+                if (missing.Count == 0)
+                {
+                    unresolved.Clear();
+                    break;
+                }
+
+                var retryable = missing
+                    .Where(id => !attempted.Contains(id) && ShouldRetryDependency(id))
+                    .ToList();
+
+                if (retryable.Count == 0)
+                {
+                    unresolved.UnionWith(missing);
+                    break;
+                }
+
+                if (lblStatus != null)
+                    lblStatus.Text = $"{retryable.Count} hiányzó függőség letöltése...";
+
+                var downloadedFiles = new List<string>();
+
+                foreach (var dependencyId in retryable)
+                {
+                    attempted.Add(dependencyId);
+                    var file = await DownloadDependencyAsync(dependencyId);
+                    if (!string.IsNullOrEmpty(file))
+                    {
+                        downloadedFiles.Add(file!);
+                        _failedDependencyAttempts.Remove(dependencyId);
+                        downloadedCount++;
+                    }
+                    else
+                    {
+                        unresolved.Add(dependencyId);
+                        _failedDependencyAttempts[dependencyId] = DateTime.UtcNow;
+                    }
+                }
+
+                var uniqueFiles = downloadedFiles
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (uniqueFiles.Count == 0)
+                    break;
+
+                AddModsToCurrentInstance(uniqueFiles);
+                await LoadModsAsync();
+
+                if (lblStatus != null)
+                    lblStatus.Text = $"{uniqueFiles.Count} függőség letöltve.";
+            }
+
+            var finalResolver = new ModDependencyResolver(AllMods);
+            unresolved.UnionWith(finalResolver.GetMissingDependencies());
+
+            if (unresolved.Count > 0)
+            {
+                var list = FormatDependencyList(unresolved);
+                Debug.WriteLine($"[Dep] Nem sikerült letölteni: {list}");
+
+                if (lblStatus != null)
+                {
+                    lblStatus.Text = unresolved.Count == 1
+                        ? $"Figyelem: hiányzó függőség ({list}) – telepítsd manuálisan."
+                        : $"Figyelem: {unresolved.Count} hiányzó függőség ({list}) – telepítsd manuálisan.";
+                }
+            }
+            else if (downloadedCount > 0 && lblStatus != null)
+            {
+                lblStatus.Text = $"{downloadedCount} függőség telepítve.";
+            }
+        }
+
+        private bool ShouldRetryDependency(string dependencyId)
+        {
+            if (!_failedDependencyAttempts.TryGetValue(dependencyId, out var lastAttempt))
+                return true;
+
+            return DateTime.UtcNow - lastAttempt >= FailedDependencyRetryDelay;
+        }
+
+        private static string FormatDependencyList(IEnumerable<string> dependencyIds)
+        {
+            var list = dependencyIds
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(id => id, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var text = string.Join(", ", list.Take(8));
+            return list.Count > 8 ? $"{text} (+{list.Count - 8})" : text;
+        }
+
+        private async Task<ModrinthProject?> ResolveProjectAsync(string dependencyId)
+        {
+            if (string.IsNullOrWhiteSpace(dependencyId)) return null;
+
+            if (_projectResolutionCache.TryGetValue(dependencyId, out var cachedProject))
+                return cachedProject;
+
+            var candidates = new List<string>();
+
+            if (_resolvedDepCache.TryGetValue(dependencyId, out var cachedSlug) &&
+                !string.IsNullOrWhiteSpace(cachedSlug))
+            {
+                candidates.Add(cachedSlug);
+            }
+
+            candidates.AddRange(ModDependencyResolver.GetProjectCandidates(dependencyId));
+
+            foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                var project = await _modrinth.GetProjectAsync(candidate);
+                if (project == null) continue;
+
+                // A dependency must be a mod, not a resource pack or modpack.
+                if (!string.IsNullOrWhiteSpace(project.ProjectType) &&
+                    !project.ProjectType.Equals("mod", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                return RememberResolvedProject(dependencyId, project);
+            }
+
+            if (lblStatus != null)
+                lblStatus.Text = $"Függőség keresése: {dependencyId}...";
+
+            var hits = await _modrinth.SearchAsync(
+                dependencyId,
+                SupportedGameVersion,
+                SupportedLoader,
+                10);
+
+            ModrinthHit? match = hits.FirstOrDefault(hit =>
+                ModDependencyResolver.MatchesDependencyName(dependencyId, hit.Slug, hit.Title));
+
+            if (match == null)
+            {
+                var normalizedId = ModDependencyResolver.Normalize(dependencyId);
+                int bestDistance = int.MaxValue;
+
+                foreach (var hit in hits)
+                {
+                    if (string.IsNullOrWhiteSpace(hit.Slug)) continue;
+                    if (string.IsNullOrWhiteSpace(hit.ProjectId)) continue;
+
+                    var normalizedSlug = ModDependencyResolver.Normalize(hit.Slug);
+                    if (normalizedSlug.Length < 4) continue;
+
+                    int distance = LevenshteinDistance(normalizedId, normalizedSlug);
+                    if (distance >= bestDistance) continue;
+
+                    bestDistance = distance;
+                    match = hit;
+                }
+
+                if (match != null && bestDistance > MaxLevenshteinDistance)
+                    match = null;
+
+                if (match != null)
+                {
+                    Debug.WriteLine(
+                        $"[Dep] Fuzzy match: '{dependencyId}' → '{match.Slug}' (dist={bestDistance})");
+                }
+            }
+
+            if (match == null)
+            {
+                Debug.WriteLine($"[Dep] Nem található Modrinth projekt: {dependencyId}");
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(match.ProjectId))
+            {
+                var project = await _modrinth.GetProjectAsync(match.ProjectId);
+                if (project != null)
+                    return RememberResolvedProject(dependencyId, project);
+            }
+
+            if (!string.IsNullOrWhiteSpace(match.Slug))
+            {
+                var project = await _modrinth.GetProjectAsync(match.Slug);
+                if (project != null)
+                    return RememberResolvedProject(dependencyId, project);
+            }
+
+            return null;
+        }
+
+        private ModrinthProject RememberResolvedProject(
+            string dependencyId,
+            ModrinthProject project)
+        {
+            _projectResolutionCache[dependencyId] = project;
+
+            var slug = !string.IsNullOrWhiteSpace(project.Slug) ? project.Slug : project.Id;
+            if (!string.IsNullOrWhiteSpace(slug))
+            {
+                _resolvedDepCache[dependencyId] = slug;
+                SaveDepAliasCache();
+            }
+
+            return project;
+        }
+
+        private async Task<string?> DownloadDependencyAsync(string dependencyId)
+        {
+            try
+            {
+                if (lblStatus != null)
+                    lblStatus.Text = $"Függőség keresése: {dependencyId}...";
+
+                var project = await ResolveProjectAsync(dependencyId);
+                if (project == null) return null;
+
+                if (lblStatus != null)
+                    lblStatus.Text = $"Függőség verziójának keresése: {project.Title}...";
+
+                string projectKey = !string.IsNullOrWhiteSpace(project.Id)
+                    ? project.Id
+                    : project.Slug;
+
+                var versions = await _modrinth.GetVersionsAsync(
+                    projectKey,
+                    SupportedGameVersion,
+                    SupportedLoader);
+
+                if (versions.Count == 0 &&
+                    !string.IsNullOrWhiteSpace(project.Slug) &&
+                    !string.Equals(project.Slug, project.Id, StringComparison.OrdinalIgnoreCase))
+                {
+                    versions = await _modrinth.GetVersionsAsync(
+                        project.Slug,
+                        SupportedGameVersion,
+                        SupportedLoader);
+                }
+
+                if (versions.Count == 0)
+                {
+                    Debug.WriteLine(
+                        $"[Dep] Nincs {SupportedGameVersion} {SupportedLoader} verzió: {dependencyId}");
+                    return null;
+                }
+
+                var best = versions
+                    .Where(version => version.Files.Count > 0)
+                    .OrderByDescending(version => version.DatePublished)
+                    .FirstOrDefault();
+
+                if (best == null) return null;
+
+                if (lblStatus != null)
+                    lblStatus.Text = $"Függőség letöltése: {project.Title} ({best.VersionNumber})...";
+
+                var progress = new Progress<string>(message =>
+                {
+                    if (lblStatus != null) lblStatus.Text = message;
+                });
+
+                var path = await _modrinth.DownloadModAsync(best, _modsFolder, progress);
+                if (path == null) return null;
+
+                var disabledPath = path + ".disabled";
+                if (File.Exists(disabledPath))
+                {
+                    try { File.Delete(disabledPath); } catch { }
+                }
+
+                return Path.GetFileName(path);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Dep] Hiba ({dependencyId}): {ex.Message}");
+                return null;
             }
         }
 
@@ -1210,13 +1713,9 @@ namespace MvpLauncher
                 {
                     var profile = _settings.Profiles.FirstOrDefault(p => p.Name == _settings.SelectedProfile);
                     if (profile != null && profile.Type == "Microsoft" && !string.IsNullOrEmpty(profile.Uuid))
-                    {
                         identifier = profile.Uuid;
-                    }
                     else
-                    {
                         identifier = _settings.SelectedProfile ?? "";
-                    }
                 }
 
                 if (string.IsNullOrEmpty(identifier))
@@ -1228,13 +1727,7 @@ namespace MvpLauncher
 
                 if (lblSkinLoading != null) lblSkinLoading.Visibility = Visibility.Collapsed;
 
-                var bitmap = new BitmapImage();
-                bitmap.BeginInit();
-                bitmap.UriSource = new Uri(SkinService.GetBodyUrl(identifier), UriKind.Absolute);
-                bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-                bitmap.EndInit();
-
+                var bitmap = ImageCache.GetOrLoad(SkinService.GetBodyUrl(identifier));
                 if (imgSkin != null) imgSkin.Source = bitmap;
             }
             catch
@@ -1272,33 +1765,23 @@ namespace MvpLauncher
                             {
                                 displayName = GetStringProperty(profile, "Gamertag");
                                 if (string.IsNullOrEmpty(displayName))
-                                {
                                     displayName = GetStringProperty(profile, "Name");
-                                }
                             }
                         }
                         catch { }
 
                         if (string.IsNullOrEmpty(displayName))
-                        {
                             displayName = GetStringProperty(account, "Gamertag");
-                        }
 
                         if (string.IsNullOrEmpty(displayName))
-                        {
                             displayName = GetStringProperty(account, "Name");
-                        }
 
                         if (string.IsNullOrEmpty(displayName))
                         {
                             if (identifier.Length >= 8)
-                            {
                                 displayName = $"MS_{identifier.Substring(0, 8)}";
-                            }
                             else
-                            {
                                 displayName = $"MS_{identifier}";
-                            }
                         }
 
                         _settings.Profiles.Add(new Profile
@@ -1323,9 +1806,7 @@ namespace MvpLauncher
                 .ToList();
 
             foreach (var name in sortedNames)
-            {
                 cmbProfiles.Items.Add(name);
-            }
 
             if (!string.IsNullOrEmpty(_settings.SelectedProfile) &&
                 cmbProfiles.Items.Contains(_settings.SelectedProfile))
@@ -1349,7 +1830,7 @@ namespace MvpLauncher
             if (cmbProfiles.SelectedItem is string name)
             {
                 _settings.SelectedProfile = name;
-                _settings.Save();
+                ScheduleSave();
                 UpdateSkin();
             }
         }
@@ -1375,13 +1856,9 @@ namespace MvpLauncher
         private void TxtNewProfile_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key == Key.Enter)
-            {
                 AddProfileFromInput();
-            }
             else if (e.Key == Key.Escape)
-            {
                 ProfileOverlay.Visibility = Visibility.Collapsed;
-            }
         }
 
         private void AddProfileFromInput()
@@ -1408,7 +1885,7 @@ namespace MvpLauncher
 
             _settings.Profiles.Add(new Profile { Name = name, Type = "Offline" });
             _settings.SelectedProfile = name;
-            _settings.Save();
+            ScheduleSave();
 
             LoadProfiles();
             ProfileOverlay.Visibility = Visibility.Collapsed;
@@ -1481,7 +1958,7 @@ namespace MvpLauncher
 
             var nextProfile = _settings.Profiles.FirstOrDefault();
             _settings.SelectedProfile = nextProfile?.Name ?? "";
-            _settings.Save();
+            ScheduleSave();
 
             LoadProfiles();
 
@@ -1512,25 +1989,15 @@ namespace MvpLauncher
                     return;
                 }
 
-                try
-                {
-                    _loginHandler.AccountManager.SaveAccounts();
-                }
-                catch { }
+                try { _loginHandler.AccountManager.SaveAccounts(); } catch { }
 
                 string sessionName = GetStringProperty(session, "Username");
                 if (string.IsNullOrEmpty(sessionName))
-                {
                     sessionName = GetStringProperty(session, "PlayerName");
-                }
                 if (string.IsNullOrEmpty(sessionName))
-                {
                     sessionName = GetStringProperty(session, "Name");
-                }
                 if (string.IsNullOrEmpty(sessionName))
-                {
                     sessionName = "Microsoft";
-                }
 
                 string identifier = session.UUID ?? string.Empty;
                 if (!string.IsNullOrEmpty(identifier) && !_settings.Profiles.Any(p => p.Uuid == identifier))
@@ -1544,7 +2011,7 @@ namespace MvpLauncher
                 }
 
                 _settings.SelectedProfile = sessionName;
-                _settings.Save();
+                ScheduleSave();
 
                 LoadProfiles();
 
@@ -1611,9 +2078,7 @@ namespace MvpLauncher
             }
 
             if (cmbJavaPreset.Items.Count > 0)
-            {
                 cmbJavaPreset.SelectedIndex = 0;
-            }
         }
 
         private void UpdateThemeDisplay()
@@ -1636,14 +2101,12 @@ namespace MvpLauncher
         private void SldRam_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
             if (lblRamValue != null)
-            {
                 lblRamValue.Text = $"{(int)e.NewValue} MB";
-            }
 
             if (!IsLoaded || _isLoadingSettings) return;
 
             _settings.RamMb = (int)e.NewValue;
-            _settings.Save();
+            ScheduleSave();
         }
 
         private void Theme_Checked(object sender, RoutedEventArgs e)
@@ -1653,12 +2116,10 @@ namespace MvpLauncher
             if (sender is RadioButton rb && rb.Tag is string theme)
             {
                 _settings.Theme = theme;
-                _settings.Save();
+                ScheduleSave();
                 ThemeManager.ApplyTheme(theme);
                 if (lblThemeDisplay != null)
-                {
                     UpdateThemeDisplay();
-                }
             }
         }
 
@@ -1669,7 +2130,7 @@ namespace MvpLauncher
             if (sender is RadioButton rb && rb.Tag is string lang)
             {
                 _settings.Language = lang;
-                _settings.Save();
+                ScheduleSave();
             }
         }
 
@@ -1680,7 +2141,7 @@ namespace MvpLauncher
             if (sender is RadioButton rb && rb.Tag is string behavior)
             {
                 _settings.LauncherBehavior = behavior;
-                _settings.Save();
+                ScheduleSave();
             }
         }
 
@@ -1693,7 +2154,7 @@ namespace MvpLauncher
                 item.Tag is string preset)
             {
                 _settings.JavaPreset = preset;
-                _settings.Save();
+                ScheduleSave();
             }
         }
 
@@ -1703,7 +2164,7 @@ namespace MvpLauncher
             if (_isLoadingSettings) return;
 
             _settings.JavaArgs = txtJavaArgs.Text;
-            _settings.Save();
+            ScheduleSave();
         }
 
         private List<string> BuildJavaArguments()
@@ -1745,9 +2206,7 @@ namespace MvpLauncher
                         var parts = _settings.JavaArgs
                             .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                         foreach (var p in parts)
-                        {
                             args.Add(p.Trim());
-                        }
                     }
                     break;
             }
@@ -1903,9 +2362,7 @@ namespace MvpLauncher
 
                 var badge = template.FindName("UpdateBadge", btnSettings) as Border;
                 if (badge != null)
-                {
                     badge.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-                }
             }
             catch { }
         }
@@ -1973,30 +2430,27 @@ namespace MvpLauncher
                 if (lblUpdateStatus != null)
                     lblUpdateStatus.Text = "Telepítő letöltése...";
 
-                using (var client = new HttpClient())
+                var client = _staticHttp;
+
+                using (var response = await client.GetAsync(setupUrl, HttpCompletionOption.ResponseHeadersRead))
                 {
-                    client.DefaultRequestHeaders.Add("User-Agent", "MvpLauncher-ForceUpdate");
+                    response.EnsureSuccessStatusCode();
+                    var totalBytes = response.Content.Headers.ContentLength ?? -1L;
 
-                    using (var response = await client.GetAsync(setupUrl, HttpCompletionOption.ResponseHeadersRead))
+                    using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (var stream = await response.Content.ReadAsStreamAsync())
                     {
-                        response.EnsureSuccessStatusCode();
-                        var totalBytes = response.Content.Headers.ContentLength ?? -1L;
-
-                        using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                        using (var stream = await response.Content.ReadAsStreamAsync())
+                        var buffer = new byte[8192];
+                        long totalRead = 0;
+                        int read;
+                        while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                         {
-                            var buffer = new byte[8192];
-                            long totalRead = 0;
-                            int read;
-                            while ((read = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            await fs.WriteAsync(buffer, 0, read);
+                            totalRead += read;
+                            if (totalBytes > 0)
                             {
-                                await fs.WriteAsync(buffer, 0, read);
-                                totalRead += read;
-                                if (totalBytes > 0)
-                                {
-                                    double pct = (double)totalRead / totalBytes * 100;
-                                    await Dispatcher.InvokeAsync(() => SetProgress(pct));
-                                }
+                                double pct = (double)totalRead / totalBytes * 100;
+                                await Dispatcher.InvokeAsync(() => SetProgress(pct));
                             }
                         }
                     }
@@ -2034,9 +2488,7 @@ namespace MvpLauncher
             try
             {
                 if (!Directory.Exists(_modsFolder))
-                {
                     Directory.CreateDirectory(_modsFolder);
-                }
 
                 Process.Start(new ProcessStartInfo
                 {
@@ -2111,7 +2563,7 @@ namespace MvpLauncher
             e.Handled = true;
         }
 
-        private void Window_Drop(object sender, DragEventArgs e)
+        private async void Window_Drop(object sender, DragEventArgs e)
         {
             try
             {
@@ -2154,7 +2606,7 @@ namespace MvpLauncher
                 if (imported > 0)
                 {
                     AddModsToCurrentInstance(importedNames);
-                    LoadMods();
+                    await LoadModsAsync();
                     if (lblStatus != null) lblStatus.Text = $"{imported} mod importálva";
                 }
             }
@@ -2197,6 +2649,11 @@ namespace MvpLauncher
 
             if (count < 0) count = 0;
             if (count > MaxMultiLaunchClients) count = MaxMultiLaunchClients;
+
+            _updatingMultiCount = true;
+            if (txtMultiCount.Text != count.ToString())
+                txtMultiCount.Text = count.ToString();
+            _updatingMultiCount = false;
 
             while (MultiLaunchInstances.Count < count)
                 AddMultiLaunchInstance();
@@ -2254,9 +2711,7 @@ namespace MvpLauncher
             inst.PropertyChanged += (s, ev) =>
             {
                 if (ev.PropertyName == nameof(MultiLaunchInstance.SelectedAccount))
-                {
                     SaveMultiLaunchToSettings();
-                }
             };
 
             inst.Index = MultiLaunchInstances.Count + 1;
@@ -2302,17 +2757,11 @@ namespace MvpLauncher
                     inst.AvailableAccounts.Add(n);
 
                 if (!string.IsNullOrEmpty(prev) && sortedNames.Contains(prev))
-                {
                     inst.SelectedAccount = prev;
-                }
                 else if (sortedNames.Count > 0)
-                {
                     inst.SelectedAccount = sortedNames[0];
-                }
                 else
-                {
                     inst.SelectedAccount = "";
-                }
             }
         }
 
@@ -2325,7 +2774,7 @@ namespace MvpLauncher
                     .Where(s => !string.IsNullOrEmpty(s))
                     .ToList();
 
-                _settings.Save();
+                ScheduleSave();
             }
             catch { }
         }
@@ -2347,9 +2796,7 @@ namespace MvpLauncher
                     .ToList();
 
                 if (restoreList.Count == 0 && _settings.Profiles.Count >= 1)
-                {
                     restoreList.Add(_settings.SelectedProfile);
-                }
 
                 MultiLaunchInstances.Clear();
 
@@ -2368,9 +2815,7 @@ namespace MvpLauncher
                     inst.PropertyChanged += (s, ev) =>
                     {
                         if (ev.PropertyName == nameof(MultiLaunchInstance.SelectedAccount))
-                        {
                             SaveMultiLaunchToSettings();
-                        }
                     };
 
                     inst.Index = MultiLaunchInstances.Count + 1;
@@ -2484,7 +2929,6 @@ namespace MvpLauncher
 
             Button? btn = el as Button;
             if (btn != null) btn.IsEnabled = false;
-            if (btnModrinthSearch != null) btnModrinthSearch.IsEnabled = false;
 
             try
             {
@@ -2504,7 +2948,7 @@ namespace MvpLauncher
                     AddModsToCurrentInstance(new[] { downloadedName });
 
                     if (lblModrinthStatus != null) lblModrinthStatus.Text = $"Letöltve: {downloadedName}";
-                    LoadMods();
+                    await LoadModsAsync();
                 }
                 else
                 {
@@ -2518,7 +2962,6 @@ namespace MvpLauncher
             finally
             {
                 if (btn != null) btn.IsEnabled = true;
-                if (btnModrinthSearch != null) btnModrinthSearch.IsEnabled = true;
             }
         }
 
@@ -2527,7 +2970,7 @@ namespace MvpLauncher
             if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath) && JavaManager.IsVersionSufficient(_javaPath))
                 return true;
 
-            _javaPath = JavaManager.FindJava();
+            _javaPath = await JavaManager.FindJavaAsync();
             if (!string.IsNullOrEmpty(_javaPath) && File.Exists(_javaPath))
                 return true;
 
@@ -2621,6 +3064,7 @@ namespace MvpLauncher
                 }
                 catch { }
 
+                sb.AppendLine($"Dep aliases cached: {_resolvedDepCache.Count}");
                 sb.AppendLine("=== End ===");
 
                 Clipboard.SetText(sb.ToString());
@@ -2943,14 +3387,10 @@ namespace MvpLauncher
                         var targetAccount = accounts.FirstOrDefault(a => a.Identifier == selectedProfile.Uuid);
 
                         if (targetAccount != null)
-                        {
                             session = await _loginHandler.Authenticate(targetAccount);
-                        }
 
                         if (session == null)
-                        {
                             session = await _loginHandler.Authenticate();
-                        }
                     }
                     catch (Exception ex)
                     {
@@ -2970,9 +3410,7 @@ namespace MvpLauncher
                 }
 
                 if (session == null)
-                {
                     session = MSession.CreateOfflineSession(username)!;
-                }
 
                 if (lblStatus != null) lblStatus.Text = "Játék indítása...";
 
@@ -2982,9 +3420,7 @@ namespace MvpLauncher
                 {
                     var javawPath = javaPathForLaunch.Substring(0, javaPathForLaunch.Length - 8) + "javaw.exe";
                     if (File.Exists(javawPath))
-                    {
                         javaPathForLaunch = javawPath;
-                    }
                 }
 
                 var jvmArgs = BuildJavaArguments();
@@ -2992,9 +3428,7 @@ namespace MvpLauncher
 
                 var mArgs = new MArgument[jvmArgs.Count];
                 for (int i = 0; i < jvmArgs.Count; i++)
-                {
                     mArgs[i] = new MArgument(jvmArgs[i]);
-                }
 
                 var launchOption = new MLaunchOption
                 {
@@ -3081,9 +3515,7 @@ namespace MvpLauncher
                 SetProgress(100);
 
                 if (behavior == "Close" || behavior == "Hide")
-                {
                     Hide();
-                }
             }
             catch (Exception ex)
             {

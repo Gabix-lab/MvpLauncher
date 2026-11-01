@@ -6,6 +6,8 @@ namespace MvpLauncher
 {
     public static class ThemeManager
     {
+        private static string? _currentTheme;
+
         public static void ApplyTheme(string theme)
         {
             string effective = theme;
@@ -13,6 +15,9 @@ namespace MvpLauncher
             {
                 effective = IsWindowsLightTheme() ? "Light" : "Dark";
             }
+
+            if (_currentTheme == effective) return;
+            _currentTheme = effective;
 
             var dict = effective == "Light" ? BuildLight() : BuildDark();
             var app = Application.Current;

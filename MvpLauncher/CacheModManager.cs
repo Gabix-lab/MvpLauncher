@@ -21,7 +21,7 @@ namespace MvpLauncher
     {
         private readonly string _cacheFolder;
         private readonly string _hashFolder;
-        private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromMinutes(3) };
+        private readonly HttpClient _httpClient = MvpLauncher.Infrastructure.HttpClients.Shared;
 
         public List<CacheMod> Mods { get; } = new();
         public string CurrentVersion { get; private set; } = "";
@@ -44,7 +44,6 @@ namespace MvpLauncher
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get,
                     $"https://api.github.com/repos/{repo}/releases/latest");
-                req.Headers.Add("User-Agent", "MvpLauncher");
                 req.Headers.Add("Accept", "application/vnd.github+json");
 
                 using var resp = await _httpClient.SendAsync(req);
@@ -243,7 +242,6 @@ namespace MvpLauncher
                     try
                     {
                         using var req = new HttpRequestMessage(HttpMethod.Get, u);
-                        req.Headers.Add("User-Agent", "MvpLauncher");
                         var resp = await _httpClient.SendAsync(req);
                         if (!resp.IsSuccessStatusCode) { progress?.Report($"HIBA: {resp.StatusCode}"); continue; }
 

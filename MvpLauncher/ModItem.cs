@@ -27,6 +27,8 @@ namespace MvpLauncher
         public string ModId { get; set; } = "";
         public bool IsMandatory { get; set; } = false;
 
+        public ObservableCollection<string> Provides { get; } = new();
+
         public string Author
         {
             get => _author;
@@ -76,6 +78,11 @@ namespace MvpLauncher
 
         public ObservableCollection<string> Dependencies { get; } = new();
         public ObservableCollection<string> Dependents { get; } = new();
+        public ObservableCollection<string> MissingDependencies { get; } = new();
+
+        public bool HasDependencyInfo => Dependencies.Count > 0 || Dependents.Count > 0;
+
+        public bool HasMissingDependencies => MissingDependencies.Count > 0;
 
         public string DependencyText
         {
@@ -92,6 +99,11 @@ namespace MvpLauncher
                 return string.Join(" | ", parts);
             }
         }
+
+        public string MissingDependencyText =>
+            MissingDependencies.Count == 0
+                ? ""
+                : $"Hiányzó függőség: {string.Join(", ", MissingDependencies)}";
 
         public bool HasVersion => !string.IsNullOrEmpty(_version);
 
@@ -156,6 +168,9 @@ namespace MvpLauncher
         public void RefreshDependencyText()
         {
             OnPropertyChanged(nameof(DependencyText));
+            OnPropertyChanged(nameof(HasDependencyInfo));
+            OnPropertyChanged(nameof(MissingDependencyText));
+            OnPropertyChanged(nameof(HasMissingDependencies));
         }
 
         public bool ToggleEnabled()

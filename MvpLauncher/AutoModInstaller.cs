@@ -7,7 +7,7 @@ namespace MvpLauncher
 {
     public static class AutoModInstaller
     {
-        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(5) };
+        private static readonly HttpClient _http = MvpLauncher.Infrastructure.HttpClients.Shared;
         private const string UserAgent = "MvpLauncher/1.0.12";
 
         public static async Task EnsureRequiredModsAsync(string modsFolder, IProgress<string>? progress = null)
@@ -79,7 +79,6 @@ namespace MvpLauncher
                 byte[] bytes;
                 using (var req = new HttpRequestMessage(HttpMethod.Get, downloadUrl))
                 {
-                    req.Headers.Add("User-Agent", UserAgent);
                     using var resp = await _http.SendAsync(req);
                     resp.EnsureSuccessStatusCode();
                     bytes = await resp.Content.ReadAsByteArrayAsync();
@@ -110,7 +109,6 @@ namespace MvpLauncher
             try
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, $"https://api.modrinth.com/v2/project/{slug}");
-                req.Headers.Add("User-Agent", UserAgent);
                 using var resp = await _http.SendAsync(req);
 
                 if (resp.IsSuccessStatusCode)
@@ -141,7 +139,6 @@ namespace MvpLauncher
             {
                 string url = $"https://api.modrinth.com/v2/search?query={Uri.EscapeDataString(displayName)}&limit=10&facets=%5B%5B%22project_type%3Amod%22%5D%5D";
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                req.Headers.Add("User-Agent", UserAgent);
                 using var resp = await _http.SendAsync(req);
 
                 if (resp.IsSuccessStatusCode)
@@ -187,7 +184,6 @@ namespace MvpLauncher
             {
                 string url = $"https://api.modrinth.com/v2/project/{projectId}/version";
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                req.Headers.Add("User-Agent", UserAgent);
                 using var resp = await _http.SendAsync(req);
 
                 if (!resp.IsSuccessStatusCode)
